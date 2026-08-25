@@ -568,7 +568,7 @@ fn translate_attempt(
                 || lower.contains("json_schema")
                 || lower.contains("structured output")
                 || lower.contains("structured_output"));
-        let message = format!("translation service returned HTTP {status}");
+        let message = http_error_message(status, &response_body);
         if format_rejected {
             return Err(AttemptError::StructuredOutputUnsupported);
         }
@@ -585,29 +585,89 @@ fn translate_attempt(
     parse_translations(content, items, with_kana).map_err(AttemptError::Other)
 }
 
+fn http_error_message(status: reqwest::StatusCode, response_body: &str) -> String {
+    let detail = serde_json::from_str::<Value>(response_body)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .pointer("/error/message")
+                .or_else(|| payload.get("message"))
+                .or_else(|| payload.get("error"))
+                .and_then(Value::as_str)
+                .map(|message| message.split_whitespace().collect::<Vec<_>>().join(" "))
+        })
+        .filter(|message| !message.is_empty())
+        .map(|message| {
+            let truncated = message.chars().take(300).collect::<String>();
+            if message.chars().count() > 300 {
+                format!("{truncated}…")
+            } else {
+                truncated
+            }
+        });
+    match detail {
+        Some(detail) => format!("translation service returned HTTP {status}: {detail}"),
+        None => format!("translation service returned HTTP {status}"),
+    }
+}
+
+fn translation_values(content: &str) -> Result<Vec<Value>, String> {
+    let trimmed = content.trim();
+    let mut candidates = Vec::new();
+    if matches!(trimmed.as_bytes().first(), Some(b'{' | b'[')) {
+        candidates.push(trimmed);
+    }
+    for (open, close) in [('{', '}'), ('[', ']')] {
+        if let (Some(start), Some(end)) = (content.find(open), content.rfind(close)) {
+            if start <= end {
+                let candidate = &content[start..=end];
+                if !candidates.contains(&candidate) {
+                    candidates.push(candidate);
+                }
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return Err("translation response did not contain JSON".into());
+    }
+
+    let mut parsed_json = false;
+    let mut last_error = None;
+    for candidate in candidates {
+        match serde_json::from_str::<Value>(candidate) {
+            Ok(Value::Array(values)) => return Ok(values),
+            Ok(Value::Object(mut object)) => {
+                parsed_json = true;
+                if let Some(Value::Array(values)) = object.remove("translations") {
+                    return Ok(values);
+                }
+            }
+            Ok(_) => parsed_json = true,
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if parsed_json {
+        Err("translation JSON has no translations array".into())
+    } else {
+        Err(format!(
+            "invalid translation JSON: {}",
+            last_error.expect("JSON candidate disappeared")
+        ))
+    }
+}
+
 fn parse_translations(
     content: &str,
     items: &[JobItem],
     with_kana: bool,
 ) -> Result<Vec<(u32, String, String)>, String> {
-    let start = content
-        .find('{')
-        .ok_or_else(|| "translation response did not contain JSON".to_string())?;
-    let end = content
-        .rfind('}')
-        .ok_or_else(|| "translation response did not contain complete JSON".to_string())?;
-    let payload: Value = serde_json::from_str(&content[start..=end])
-        .map_err(|error| format!("invalid translation JSON: {error}"))?;
-    let values = payload
-        .get("translations")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "translation JSON has no translations array".to_string())?;
+    let values = translation_values(content)?;
     let sources: HashMap<u32, &str> = items
         .iter()
         .map(|item| (item.index, item.source.as_str()))
         .collect();
     let mut output = Vec::new();
-    for value in values {
+    for value in &values {
         let Some(index) = value.get("index").and_then(Value::as_u64) else {
             continue;
         };
@@ -967,6 +1027,35 @@ mod tests {
         .unwrap();
         assert_eq!(result[0], (0, "背单词".into(), "recite words".into()));
         assert_eq!(result[1].0, 2);
+    }
+
+    #[test]
+    fn parses_top_level_array_from_schema_ignoring_backend() {
+        let result = parse_translations(
+            r#"[{"index":0,"text":"単語を覚える","reading":"たんごをおぼえる"}]"#,
+            &items(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            result[0],
+            (
+                0,
+                "背单词".into(),
+                "単語を覚える（たんごをおぼえる）".into()
+            )
+        );
+    }
+
+    #[test]
+    fn includes_safe_json_detail_in_http_errors() {
+        assert_eq!(
+            http_error_message(
+                reqwest::StatusCode::NOT_FOUND,
+                r#"{"error":{"message":"model is not available"}}"#,
+            ),
+            "translation service returned HTTP 404 Not Found: model is not available"
+        );
     }
 
     #[test]
