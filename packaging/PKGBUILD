@@ -1,6 +1,6 @@
 pkgname=fcitx5-candidate-translator
 pkgver=0.1.0
-pkgrel=4
+pkgrel=6
 pkgdesc='Translate Fcitx5 Shuangpin candidates with an OpenAI-compatible API'
 arch=('x86_64')
 url=''

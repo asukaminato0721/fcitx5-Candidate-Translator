@@ -70,26 +70,9 @@ FCITX_CONFIGURATION(
     fcitx::Option<bool> clearCache{
         this, "ClearCache", _("Clear translation cache on Apply"), false};)
 
-class CandidateCommentAccess : public fcitx::CandidateWord {
-public:
-    static void set(fcitx::CandidateWord &word, fcitx::Text text) {
-        auto setter = &CandidateCommentAccess::setComment;
-        (word.*setter)(std::move(text));
-    }
-
-    void select(fcitx::InputContext *) const override {}
-};
-
-struct Decoration {
-    fcitx::CandidateWord *word;
-    fcitx::Text original;
-    std::string applied;
-    std::string translation;
-};
-
 struct ContextState {
     std::shared_ptr<fcitx::CandidateList> list;
-    std::vector<Decoration> decorations;
+    std::unordered_map<std::string, std::string> translations;
     std::string signature;
     std::uint64_t currentRequest = 0;
 };
@@ -111,27 +94,6 @@ struct CallbackContext {
     std::mutex mutex;
     CandidateTranslatorAddon *addon = nullptr;
 };
-
-bool containsCandidate(const std::shared_ptr<fcitx::CandidateList> &list,
-                       const fcitx::CandidateWord *word) {
-    if (!list) {
-        return false;
-    }
-    if (auto *bulk = list->toBulk()) {
-        for (int index = 0; index < bulk->totalSize(); ++index) {
-            if (&bulk->candidateFromAll(index) == word) {
-                return true;
-            }
-        }
-        return false;
-    }
-    for (int index = 0; index < list->size(); ++index) {
-        if (&list->candidate(index) == word) {
-            return true;
-        }
-    }
-    return false;
-}
 
 bool containsHan(std::string_view text) {
     for (std::size_t offset = 0; offset < text.size();) {
@@ -182,6 +144,10 @@ public:
         : instance_(instance), callbackContext_(std::make_unique<CallbackContext>()) {
         callbackContext_->addon = this;
         reloadConfig();
+        outputConnection_ = instance_->connect<fcitx::Instance::OutputFilter>(
+            [this](fcitx::InputContext *inputContext, fcitx::Text &text) {
+                filterOutput(inputContext, text);
+            });
         handlers_.emplace_back(instance_->watchEvent(
             fcitx::EventType::InputContextUpdateUI,
             fcitx::EventWatcherPhase::Default,
@@ -205,14 +171,14 @@ public:
             std::lock_guard lock(callbackContext_->mutex);
             callbackContext_->addon = nullptr;
         }
-        restoreAll();
+        clearAll();
         ct_shutdown();
     }
 
     const fcitx::Configuration *getConfig() const override { return &config_; }
 
     void setConfig(const fcitx::RawConfig &rawConfig) override {
-        restoreAll();
+        clearAll();
         config_.load(rawConfig, true);
         if (*config_.clearCache) {
             ct_clear_cache();
@@ -223,7 +189,7 @@ public:
     }
 
     void reloadConfig() override {
-        restoreAll();
+        clearAll();
         fcitx::readAsIni(config_, kConfigPath);
         configureBackend();
     }
@@ -307,63 +273,35 @@ private:
         ::chmod(configPath.c_str(), 0600);
     }
 
-    void restore(ContextState &state) {
-        for (auto &decoration : state.decorations) {
-            if (containsCandidate(state.list, decoration.word) &&
-                decoration.word->comment().toString() == decoration.applied) {
-                CandidateCommentAccess::set(*decoration.word,
-                                            std::move(decoration.original));
-            }
-        }
-        state.decorations.clear();
-    }
-
-    void restoreAll() {
-        for (auto &[_, state] : contexts_) {
-            restore(state);
-        }
+    void clearAll() {
         contexts_.clear();
         pending_.clear();
     }
 
     void removeInputContext(fcitx::InputContext *inputContext) {
-        if (auto iter = contexts_.find(inputContext); iter != contexts_.end()) {
-            restore(iter->second);
-            contexts_.erase(iter);
-        }
+        contexts_.erase(inputContext);
         std::erase_if(pending_, [inputContext](const auto &entry) {
             return entry.second.inputContext == inputContext;
         });
     }
 
-    void applyTranslation(ContextState &state, fcitx::CandidateWord &word,
-                          const std::string &translation) {
-        auto existing = std::find_if(
-            state.decorations.begin(), state.decorations.end(),
-            [&word](const Decoration &item) { return item.word == &word; });
-        if (existing != state.decorations.end()) {
-            if (existing->translation == translation &&
-                word.comment().toString() == existing->applied) {
-                return;
-            }
-            if (word.comment().toString() == existing->applied) {
-                CandidateCommentAccess::set(word, existing->original);
-            } else {
-                existing->original = word.comment();
-            }
-            state.decorations.erase(existing);
+    void filterOutput(fcitx::InputContext *inputContext, fcitx::Text &text) {
+        auto state = contexts_.find(inputContext);
+        if (state == contexts_.end() ||
+            instance_->inputMethod(inputContext) != "shuangpin") {
+            return;
         }
-
-        fcitx::Text original = word.comment();
-        fcitx::Text combined = original;
-        if (!combined.empty()) {
-            combined.append(" · ");
+        auto currentList = inputContext->inputPanel().candidateList();
+        if (!currentList || currentList.get() != state->second.list.get()) {
+            return;
         }
-        combined.append(translation);
-        const auto applied = combined.toString();
-        CandidateCommentAccess::set(word, std::move(combined));
-        state.decorations.push_back(
-            Decoration{&word, std::move(original), applied, translation});
+        const auto source = text.toStringForCommit();
+        auto translation = state->second.translations.find(source);
+        if (translation == state->second.translations.end()) {
+            return;
+        }
+        text.append("  ");
+        text.append(translation->second, fcitx::TextFormatFlag::Italic);
     }
 
     void updateInputContext(fcitx::InputContext *inputContext) {
@@ -377,7 +315,6 @@ private:
             if (state.currentRequest != 0) {
                 pending_.erase(state.currentRequest);
             }
-            restore(state);
             state = {};
             return;
         }
@@ -386,16 +323,16 @@ private:
             if (state.currentRequest != 0) {
                 pending_.erase(state.currentRequest);
             }
-            restore(state);
             state = {};
             state.list = list;
         }
 
         std::string signature = targetLanguage();
+        state.translations.clear();
         std::vector<std::uint32_t> missingIndices;
         std::vector<std::string> missingSources;
         for (int index = 0; index < list->size(); ++index) {
-            auto &word = const_cast<fcitx::CandidateWord &>(list->candidate(index));
+            const auto &word = list->candidate(index);
             const auto source = word.text().toStringForCommit();
             signature.append("\x1f").append(source);
             if (!containsHan(source) || utf8Characters(source) > 32 ||
@@ -404,7 +341,7 @@ private:
             }
             char *cached = ct_lookup(targetLanguage().c_str(), source.c_str());
             if (cached) {
-                applyTranslation(state, word, cached);
+                state.translations.insert_or_assign(source, cached);
                 ct_string_free(cached);
             } else {
                 missingIndices.push_back(static_cast<std::uint32_t>(index));
@@ -464,9 +401,10 @@ private:
                 translation.empty()) {
                 continue;
             }
-            auto &word = const_cast<fcitx::CandidateWord &>(
-                currentList->candidate(static_cast<int>(index)));
-            applyTranslation(state, word, translation);
+            const auto &word =
+                currentList->candidate(static_cast<int>(index));
+            state.translations.insert_or_assign(
+                word.text().toStringForCommit(), translation);
         }
         request.inputContext->updateUserInterface(
             fcitx::UserInterfaceComponent::InputPanel);
@@ -474,6 +412,7 @@ private:
 
     fcitx::Instance *instance_;
     TranslatorConfig config_;
+    fcitx::Connection outputConnection_;
     std::vector<std::unique_ptr<fcitx::HandlerTableEntry<fcitx::EventHandler>>>
         handlers_;
     std::unordered_map<fcitx::InputContext *, ContextState> contexts_;
@@ -492,21 +431,10 @@ public:
 } // namespace
 
 extern "C" bool ct_cpp_self_test() {
-    class TestCandidate final : public fcitx::CandidateWord {
-    public:
-        TestCandidate() : fcitx::CandidateWord(fcitx::Text("candidate")) {
-            setComment(fcitx::Text("original"));
-        }
-        void select(fcitx::InputContext *) const override {}
-    } candidate;
-
-    fcitx::CandidateWord &base = candidate;
-    CandidateCommentAccess::set(base, fcitx::Text("translated"));
-    const bool typePreserved = dynamic_cast<TestCandidate *>(&base) != nullptr;
-    const bool commentApplied = base.comment().toString() == "translated";
-    CandidateCommentAccess::set(base, fcitx::Text("original"));
-    return typePreserved && commentApplied &&
-           base.comment().toString() == "original";
+    fcitx::Text display("candidate");
+    display.append("  ");
+    display.append("translation", fcitx::TextFormatFlag::Italic);
+    return display.toString() == "candidate  translation";
 }
 
 extern "C" fcitx::AddonFactory *ct_cpp_addon_factory_instance() {

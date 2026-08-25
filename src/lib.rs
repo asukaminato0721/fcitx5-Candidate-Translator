@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -193,7 +193,7 @@ fn parse_csv_line(line: &str) -> Option<Vec<String>> {
 
 fn first_gloss(value: &str, japanese: bool) -> String {
     let separators: &[char] = if japanese {
-        &['／', '；', ';']
+        &['／', '/', '；', ';']
     } else {
         &['/', ';']
     };
@@ -226,6 +226,9 @@ fn is_han(character: char) -> bool {
 }
 
 fn kana_reading(text: &str) -> Option<String> {
+    if text.chars().count() > 32 {
+        return None;
+    }
     let hiragana: String = text
         .chars()
         .map(|character| {
@@ -248,12 +251,34 @@ fn kana_reading(text: &str) -> Option<String> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    child.stdin.as_mut()?.write_all(text.as_bytes()).ok()?;
-    let output = child.wait_with_output().ok()?;
-    if !output.status.success() {
+    let mut stdin = child.stdin.take()?;
+    if stdin.write_all(text.as_bytes()).is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
         return None;
     }
-    let reading = String::from_utf8(output.stdout)
+    drop(stdin);
+
+    let deadline = Instant::now() + Duration::from_millis(200);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(2));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    let mut output = Vec::new();
+    child.stdout.take()?.read_to_end(&mut output).ok()?;
+    let reading = String::from_utf8(output)
         .ok()?
         .split_whitespace()
         .collect::<String>();
@@ -793,12 +818,12 @@ fn translation_values(content: &str) -> Result<Vec<Value>, String> {
         candidates.push(trimmed);
     }
     for (open, close) in [('{', '}'), ('[', ']')] {
-        if let (Some(start), Some(end)) = (content.find(open), content.rfind(close)) {
-            if start <= end {
-                let candidate = &content[start..=end];
-                if !candidates.contains(&candidate) {
-                    candidates.push(candidate);
-                }
+        if let (Some(start), Some(end)) = (content.find(open), content.rfind(close))
+            && start <= end
+        {
+            let candidate = &content[start..=end];
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
             }
         }
     }
@@ -1315,6 +1340,12 @@ mod tests {
     }
 
     #[test]
+    fn japanese_dictionary_gloss_splits_ascii_slashes() {
+        assert_eq!(first_gloss("事柄/物事/仕事/出来事", true), "事柄");
+        assert_eq!(first_gloss("時／時刻／時間", true), "時");
+    }
+
+    #[test]
     fn only_allows_secure_or_loopback_urls() {
         assert!(validate_url("https://example.com/v1").is_ok());
         assert!(validate_url("http://127.0.0.1:8000/v1").is_ok());
@@ -1322,7 +1353,7 @@ mod tests {
     }
 
     #[test]
-    fn cpp_accessor_preserves_candidate_type() {
+    fn cpp_output_decoration_uses_text_copy() {
         assert!(unsafe { ct_cpp_self_test() });
     }
 
