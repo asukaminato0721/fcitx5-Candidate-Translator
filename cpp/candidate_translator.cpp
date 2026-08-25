@@ -287,11 +287,14 @@ private:
                 .userDirectory(fcitx::StandardPathsType::Cache) /
             "candidate-translator/cache-v1.json";
         const auto reasoning = reasoningEffort();
+        const auto dictionaryPath = fcitx::StandardPaths::global().locate(
+            fcitx::StandardPathsType::PkgData,
+            "candidate-translator/cedict_ts.csv");
         ct_configure(*config_.enabled, config_.baseUrl->c_str(),
                      config_.model->c_str(), config_.apiKey->c_str(),
-                     reasoning.c_str(), *config_.requestTimeoutMs,
-                     *config_.debounceMs, *config_.cacheEntries,
-                     cachePath.c_str());
+                     reasoning.c_str(), dictionaryPath.c_str(),
+                     *config_.requestTimeoutMs, *config_.debounceMs,
+                     *config_.cacheEntries, cachePath.c_str());
         const auto configPath =
             fcitx::StandardPaths::global()
                 .userDirectory(fcitx::StandardPathsType::Config) /

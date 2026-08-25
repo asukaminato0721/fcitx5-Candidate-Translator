@@ -4,9 +4,10 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::ptr;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -34,6 +35,7 @@ struct Config {
     model: String,
     api_key: String,
     reasoning_effort: String,
+    dictionary_path: PathBuf,
     timeout: Duration,
     debounce: Duration,
     cache_entries: usize,
@@ -84,6 +86,178 @@ struct Cache {
     entries: HashMap<String, CacheEntry>,
     clock: u64,
     loaded_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+struct DictionaryEntry {
+    english: String,
+    japanese: String,
+}
+
+#[derive(Default)]
+struct ShortDictionary {
+    entries: HashMap<String, DictionaryEntry>,
+    loaded_path: Option<PathBuf>,
+}
+
+impl ShortDictionary {
+    fn ensure_loaded(&mut self, path: &Path) {
+        if path.as_os_str().is_empty() || self.loaded_path.as_deref() == Some(path) {
+            return;
+        }
+        self.entries.clear();
+        self.loaded_path = Some(path.to_path_buf());
+        let Ok(file) = fs::File::open(path) else {
+            return;
+        };
+        for (line_number, line) in BufReader::new(file).lines().enumerate() {
+            let Ok(line) = line else { continue };
+            if line_number == 0 {
+                continue;
+            }
+            let Some(fields) = parse_csv_line(line.trim_start_matches('\u{feff}')) else {
+                continue;
+            };
+            if fields.len() != 5 {
+                continue;
+            }
+            let source = fields[1].trim();
+            let length = source.chars().count();
+            if !(1..=4).contains(&length) || !source.chars().any(is_han) {
+                continue;
+            }
+            let english = first_gloss(&fields[3], false);
+            let japanese = first_gloss(&fields[4], true);
+            if english.is_empty() && japanese.is_empty() {
+                continue;
+            }
+            let candidate = DictionaryEntry { english, japanese };
+            self.entries
+                .entry(source.to_string())
+                .and_modify(|current| {
+                    if entry_score(&candidate) < entry_score(current) {
+                        *current = candidate.clone();
+                    }
+                })
+                .or_insert(candidate);
+        }
+    }
+
+    fn lookup(&self, target: &str, source: &str) -> Option<String> {
+        let entry = self.entries.get(source)?;
+        if target == "English" {
+            return (!entry.english.is_empty()).then(|| entry.english.clone());
+        }
+        if !target.starts_with("Japanese") || entry.japanese.is_empty() {
+            return None;
+        }
+        if target != "JapaneseWithKana" {
+            return Some(entry.japanese.clone());
+        }
+        let reading = kana_reading(&entry.japanese);
+        match reading {
+            Some(reading) if reading != entry.japanese => {
+                Some(format!("{}（{}）", entry.japanese, reading))
+            }
+            _ => Some(entry.japanese.clone()),
+        }
+    }
+}
+
+fn entry_score(entry: &DictionaryEntry) -> usize {
+    entry.english.chars().count() + entry.japanese.chars().count()
+}
+
+fn parse_csv_line(line: &str) -> Option<Vec<String>> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut characters = line.chars().peekable();
+    let mut quoted = false;
+    while let Some(character) = characters.next() {
+        match character {
+            '"' if quoted && characters.peek() == Some(&'"') => {
+                field.push('"');
+                characters.next();
+            }
+            '"' => quoted = !quoted,
+            ',' if !quoted => fields.push(std::mem::take(&mut field)),
+            _ => field.push(character),
+        }
+    }
+    if quoted {
+        return None;
+    }
+    fields.push(field);
+    Some(fields)
+}
+
+fn first_gloss(value: &str, japanese: bool) -> String {
+    let separators: &[char] = if japanese {
+        &['／', '；', ';']
+    } else {
+        &['/', ';']
+    };
+    let mut gloss = value
+        .split(separators)
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    loop {
+        let closing = if gloss.starts_with('(') {
+            gloss.find(')').map(|index| index + 1)
+        } else if gloss.starts_with('（') {
+            gloss.find('）').map(|index| index + '）'.len_utf8())
+        } else {
+            None
+        };
+        let Some(closing) = closing else { break };
+        gloss = gloss[closing..].trim().to_string();
+    }
+    if gloss.chars().count() > 48 {
+        String::new()
+    } else {
+        gloss
+    }
+}
+
+fn is_han(character: char) -> bool {
+    matches!(character as u32, 0x3400..=0x9fff | 0x20000..=0x323af)
+}
+
+fn kana_reading(text: &str) -> Option<String> {
+    let hiragana: String = text
+        .chars()
+        .map(|character| {
+            let codepoint = character as u32;
+            if (0x30a1..=0x30f6).contains(&codepoint) {
+                char::from_u32(codepoint - 0x60).unwrap_or(character)
+            } else {
+                character
+            }
+        })
+        .collect();
+    if !hiragana.chars().any(is_han) {
+        return is_kana_reading(&hiragana).then_some(hiragana);
+    }
+
+    let mut child = Command::new("kakasi")
+        .args(["-JH", "-KH", "-iutf8", "-outf8"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.as_mut()?.write_all(text.as_bytes()).ok()?;
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let reading = String::from_utf8(output.stdout)
+        .ok()?
+        .split_whitespace()
+        .collect::<String>();
+    (!reading.is_empty() && is_kana_reading(&reading)).then_some(reading)
 }
 
 impl Cache {
@@ -174,6 +348,7 @@ impl Cache {
 struct State {
     config: Config,
     cache: Cache,
+    dictionary: ShortDictionary,
     pending: Option<Job>,
     pending_generation: u64,
     stopping: bool,
@@ -678,6 +853,7 @@ pub unsafe extern "C" fn ct_configure(
     model: *const c_char,
     api_key: *const c_char,
     reasoning_effort: *const c_char,
+    dictionary_path: *const c_char,
     timeout_ms: u64,
     debounce_ms: u64,
     cache_entries: usize,
@@ -693,6 +869,7 @@ pub unsafe extern "C" fn ct_configure(
         model: unsafe { cstr(model) },
         api_key: unsafe { cstr(api_key) },
         reasoning_effort: unsafe { cstr(reasoning_effort) },
+        dictionary_path: PathBuf::from(unsafe { cstr(dictionary_path) }),
         timeout: Duration::from_millis(timeout_ms.clamp(500, 15_000)),
         debounce: Duration::from_millis(debounce_ms.clamp(0, 2_000)),
         cache_entries: cache_entries.min(100_000),
@@ -701,6 +878,8 @@ pub unsafe extern "C" fn ct_configure(
     let path = state.config.cache_path.clone();
     let limit = state.config.cache_entries;
     state.cache.ensure_loaded(&path, limit);
+    let dictionary_path = state.config.dictionary_path.clone();
+    state.dictionary.ensure_loaded(&dictionary_path);
     state.cooldown_until = None;
     condvar.notify_all();
 }
@@ -718,9 +897,11 @@ pub unsafe extern "C" fn ct_lookup(target: *const c_char, source: *const c_char)
     let target = unsafe { cstr(target) };
     let source = unsafe { cstr(source) };
     let key = cache_key(&state.config, &target, &source);
-    state
+    let translation = state
         .cache
         .get(&key)
+        .or_else(|| state.dictionary.lookup(&target, &source));
+    translation
         .map(|text| c_string(&text).into_raw())
         .unwrap_or(ptr::null_mut())
 }
@@ -990,6 +1171,42 @@ mod tests {
         cache.put("c".into(), "C".into(), 2);
         assert!(!cache.entries.contains_key("b"));
         assert!(cache.entries.contains_key("a"));
+    }
+
+    #[test]
+    fn short_dictionary_parses_csv_and_returns_instant_glosses() {
+        let unique = format!(
+            "fcitx-short-dict-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let directory = std::env::temp_dir().join(unique);
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("dict.csv");
+        fs::write(
+            &path,
+            "\u{feff}kanji,kanji_s,pron,means,means_ja\n測試,测试,ce4 shi4,\"to test (machinery, etc)/a test\",\"(機械などを)テストする／ベータ版\"\n",
+        )
+        .unwrap();
+
+        let mut dictionary = ShortDictionary::default();
+        dictionary.ensure_loaded(&path);
+        assert_eq!(
+            dictionary.lookup("English", "测试"),
+            Some("to test (machinery, etc)".into())
+        );
+        assert_eq!(
+            dictionary.lookup("Japanese", "测试"),
+            Some("テストする".into())
+        );
+        assert_eq!(
+            dictionary.lookup("JapaneseWithKana", "测试"),
+            Some("テストする（てすとする）".into())
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

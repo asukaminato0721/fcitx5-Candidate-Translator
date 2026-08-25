@@ -2,6 +2,8 @@
 
 给 fcitx5 双拼候选词追加英语或日语翻译。
 
+1–4 个汉字的短词会优先查询随包安装的 MJdic 离线词典，命中后立即显示；日语读音由本地 Kakasi 生成。词典和持久缓存都未命中时，才调用远程 API。
+
 ![](./Screenshot.png)
 
 当前版本针对 fcitx5 5.1.x、`shuangpin` 输入法和 OpenAI Chat Completions 兼容接口。候选翻译会发送到你配置的远程服务；密码和敏感输入框不会发送请求。

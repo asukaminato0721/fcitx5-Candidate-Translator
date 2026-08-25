@@ -1,15 +1,15 @@
 pkgname=fcitx5-candidate-translator
 pkgver=0.1.0
-pkgrel=3
+pkgrel=4
 pkgdesc='Translate Fcitx5 Shuangpin candidates with an OpenAI-compatible API'
 arch=('x86_64')
 url=''
-license=('MIT')
-depends=('fcitx5>=5.1.20' 'gcc-libs' 'glibc')
+license=('MIT' 'CC-BY-SA-4.0')
+depends=('fcitx5>=5.1.20' 'gcc-libs' 'glibc' 'kakasi')
 makedepends=('cargo' 'gcc' 'pkgconf')
 options=('!lto')
-source=()
-sha256sums=()
+source=('cedict_ts.csv::https://raw.githubusercontent.com/code4fukui/MJdic/master/cedict_ts.csv')
+sha256sums=('23d94b2ee743662fd00cf0929caaf3f19362912f0765335a9d86816338388aef')
 
 build() {
   cd "$startdir/.."
@@ -22,8 +22,12 @@ package() {
     "$pkgdir/usr/lib/fcitx5/libfcitx5-candidate-translator.so"
   install -Dm644 data/candidate-translator.conf \
     "$pkgdir/usr/share/fcitx5/addon/candidate-translator.conf"
+  install -Dm644 "$srcdir/cedict_ts.csv" \
+    "$pkgdir/usr/share/fcitx5/candidate-translator/cedict_ts.csv"
   install -Dm644 README.md \
     "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 data/MJDIC-NOTICE.md \
+    "$pkgdir/usr/share/doc/$pkgname/MJDIC-NOTICE.md"
   install -Dm644 LICENSE \
     "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
