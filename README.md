@@ -1,6 +1,8 @@
 # fcitx5 Candidate Translator
 
-给 fcitx5 双拼候选词追加英语或日语翻译。插件只修改候选词的显示注释，实际提交内容、候选顺序和双拼的选词、翻页、删词等行为保持不变。
+给 fcitx5 双拼候选词追加英语或日语翻译。
+
+![](./Screenshot.png)
 
 当前版本针对 fcitx5 5.1.x、`shuangpin` 输入法和 OpenAI Chat Completions 兼容接口。候选翻译会发送到你配置的远程服务；密码和敏感输入框不会发送请求。
 
@@ -48,7 +50,7 @@ fcitx5 -r
 
 ## 接口约定
 
-插件批量发送当前页中包含汉字的候选词，并优先通过 Chat Completions 的严格 `response_format: json_schema` 约束响应。prompt 只描述翻译任务，不再重复 JSON 结构。英语 Schema 包含 `index` 和 `text`；日语启用假名注音时还要求平假名 `reading`：
+插件批量发送当前页中包含汉字的候选词，并优先通过 Chat Completions 的严格 `response_format: json_schema` 约束响应。prompt 只描述翻译任务。英语 Schema 包含 `index` 和 `text`；日语启用假名注音时还要求平假名 `reading`：
 
 ```json
 {
