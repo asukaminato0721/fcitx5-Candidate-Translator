@@ -37,6 +37,10 @@ constexpr char kConfigPath[] = "conf/candidate-translator.conf";
 enum class TargetLanguage { English, Japanese };
 FCITX_CONFIG_ENUM_NAME_WITH_I18N(TargetLanguage, N_("English"), N_("Japanese"))
 
+enum class ReasoningEffortMode { Auto, None, Low, Medium };
+FCITX_CONFIG_ENUM_NAME_WITH_I18N(ReasoningEffortMode, N_("Auto"), N_("None"),
+                                 N_("Low"), N_("Medium"))
+
 FCITX_CONFIGURATION(
     TranslatorConfig,
     fcitx::Option<bool> enabled{this, "Enabled", _("Enable candidate translation"), true};
@@ -47,6 +51,13 @@ FCITX_CONFIGURATION(
     fcitx::OptionWithAnnotation<TargetLanguage, TargetLanguageI18NAnnotation>
         targetLanguage{this, "TargetLanguage", _("Target language"),
                        TargetLanguage::English};
+    fcitx::Option<bool> showKanaReading{
+        this, "ShowKanaReading", _("Show kana reading for Japanese translations"),
+        true};
+    fcitx::OptionWithAnnotation<ReasoningEffortMode,
+                                ReasoningEffortModeI18NAnnotation>
+        reasoningEffort{this, "ReasoningEffort", _("Reasoning effort"),
+                        ReasoningEffortMode::Auto};
     fcitx::Option<int, fcitx::IntConstrain> debounceMs{
         this, "DebounceMs", _("Request debounce (milliseconds)"), 180,
         fcitx::IntConstrain(0, 2000)};
@@ -245,8 +256,10 @@ private:
     }
 
     std::string targetLanguage() const {
-        return *config_.targetLanguage == TargetLanguage::Japanese ? "Japanese"
-                                                                   : "English";
+        if (*config_.targetLanguage != TargetLanguage::Japanese) {
+            return "English";
+        }
+        return *config_.showKanaReading ? "JapaneseWithKana" : "Japanese";
     }
 
     bool configured() const {
@@ -254,15 +267,31 @@ private:
                !config_.model->empty() && !config_.apiKey->empty();
     }
 
+    std::string reasoningEffort() const {
+        switch (*config_.reasoningEffort) {
+        case ReasoningEffortMode::None:
+            return "none";
+        case ReasoningEffortMode::Low:
+            return "low";
+        case ReasoningEffortMode::Medium:
+            return "medium";
+        case ReasoningEffortMode::Auto:
+            return "";
+        }
+        return "";
+    }
+
     void configureBackend() {
         const auto cachePath =
             fcitx::StandardPaths::global()
                 .userDirectory(fcitx::StandardPathsType::Cache) /
             "candidate-translator/cache-v1.json";
+        const auto reasoning = reasoningEffort();
         ct_configure(*config_.enabled, config_.baseUrl->c_str(),
                      config_.model->c_str(), config_.apiKey->c_str(),
-                     *config_.requestTimeoutMs, *config_.debounceMs,
-                     *config_.cacheEntries, cachePath.c_str());
+                     reasoning.c_str(), *config_.requestTimeoutMs,
+                     *config_.debounceMs, *config_.cacheEntries,
+                     cachePath.c_str());
         const auto configPath =
             fcitx::StandardPaths::global()
                 .userDirectory(fcitx::StandardPathsType::Config) /

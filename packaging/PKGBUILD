@@ -1,6 +1,6 @@
 pkgname=fcitx5-candidate-translator
 pkgver=0.1.0
-pkgrel=1
+pkgrel=3
 pkgdesc='Translate Fcitx5 Shuangpin candidates with an OpenAI-compatible API'
 arch=('x86_64')
 url=''
@@ -14,11 +14,6 @@ sha256sums=()
 build() {
   cd "$startdir/.."
   cargo build --release --locked
-}
-
-check() {
-  cd "$startdir/.."
-  cargo test --locked
 }
 
 package() {

@@ -1,7 +1,7 @@
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -33,6 +33,7 @@ struct Config {
     base_url: String,
     model: String,
     api_key: String,
+    reasoning_effort: String,
     timeout: Duration,
     debounce: Duration,
     cache_entries: usize,
@@ -177,6 +178,7 @@ struct State {
     pending_generation: u64,
     stopping: bool,
     cooldown_until: Option<Instant>,
+    structured_output_unsupported: HashSet<String>,
 }
 
 struct Engine {
@@ -247,10 +249,36 @@ fn cache_key(config: &Config, target: &str, source: &str) -> String {
     serde_json::to_string(&[
         config.base_url.trim_end_matches('/'),
         config.model.as_str(),
+        config.reasoning_effort.as_str(),
         target,
         source,
     ])
     .unwrap_or_default()
+}
+
+fn backend_key(config: &Config) -> String {
+    format!(
+        "{}\x1f{}",
+        config.base_url.trim_end_matches('/'),
+        config.model
+    )
+}
+
+#[derive(Debug)]
+struct TranslationBatch {
+    translations: Vec<(u32, String, String)>,
+    structured_output_unsupported: bool,
+}
+
+#[derive(Debug)]
+struct TranslationFailure {
+    message: String,
+    structured_output_unsupported: bool,
+}
+
+enum AttemptError {
+    StructuredOutputUnsupported,
+    Other(String),
 }
 
 fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>) {
@@ -291,10 +319,16 @@ fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>) {
                 .cooldown_until
                 .is_some_and(|deadline| deadline > Instant::now())
             {
-                Err("translation service is cooling down after an error".to_string())
+                Err(TranslationFailure {
+                    message: "translation service is cooling down after an error".to_string(),
+                    structured_output_unsupported: false,
+                })
             } else {
+                let try_structured_output = !state
+                    .structured_output_unsupported
+                    .contains(&backend_key(&config));
                 drop(state);
-                translate(&config, &job.target, &job.items)
+                translate_with_fallback(&config, &job.target, &job.items, try_structured_output)
             }
         };
 
@@ -303,12 +337,17 @@ fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>) {
             error: CString::default(),
         };
         match result {
-            Ok(translations) => {
+            Ok(batch) => {
                 let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
                 state.cooldown_until = None;
+                if batch.structured_output_unsupported {
+                    state
+                        .structured_output_unsupported
+                        .insert(backend_key(&config));
+                }
                 let cache_path = state.config.cache_path.clone();
                 let cache_limit = state.config.cache_entries;
-                for (index, source, text) in translations {
+                for (index, source, text) in batch.translations {
                     let key = cache_key(&config, &job.target, &source);
                     state.cache.put(key, text.clone(), cache_limit);
                     output.translations.push(Translation {
@@ -320,8 +359,13 @@ fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>) {
             }
             Err(error) => {
                 let mut state = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+                if error.structured_output_unsupported {
+                    state
+                        .structured_output_unsupported
+                        .insert(backend_key(&config));
+                }
                 state.cooldown_until = Some(Instant::now() + Duration::from_secs(5));
-                output.error = c_string(&error);
+                output.error = c_string(&error.message);
             }
         }
 
@@ -344,23 +388,150 @@ fn validate_url(base_url: &str) -> Result<String, String> {
     ))
 }
 
-fn translate(
+fn translate_with_fallback(
     config: &Config,
     target: &str,
     items: &[JobItem],
-) -> Result<Vec<(u32, String, String)>, String> {
-    if !config.ready() {
-        return Err("translation API is not fully configured".into());
+    try_structured_output: bool,
+) -> Result<TranslationBatch, TranslationFailure> {
+    if try_structured_output {
+        match translate_attempt(config, target, items, true) {
+            Ok(translations) => {
+                return Ok(TranslationBatch {
+                    translations,
+                    structured_output_unsupported: false,
+                });
+            }
+            Err(AttemptError::StructuredOutputUnsupported) => {
+                return translate_attempt(config, target, items, false)
+                    .map(|translations| TranslationBatch {
+                        translations,
+                        structured_output_unsupported: true,
+                    })
+                    .map_err(|error| TranslationFailure {
+                        message: match error {
+                            AttemptError::StructuredOutputUnsupported => {
+                                "structured output is unsupported".to_string()
+                            }
+                            AttemptError::Other(message) => message,
+                        },
+                        structured_output_unsupported: true,
+                    });
+            }
+            Err(AttemptError::Other(message)) => {
+                return Err(TranslationFailure {
+                    message,
+                    structured_output_unsupported: false,
+                });
+            }
+        }
     }
-    let endpoint = validate_url(&config.base_url)?;
+
+    translate_attempt(config, target, items, false)
+        .map(|translations| TranslationBatch {
+            translations,
+            structured_output_unsupported: false,
+        })
+        .map_err(|error| TranslationFailure {
+            message: match error {
+                AttemptError::StructuredOutputUnsupported => {
+                    "structured output is unsupported".to_string()
+                }
+                AttemptError::Other(message) => message,
+            },
+            structured_output_unsupported: false,
+        })
+}
+
+fn structured_output_format(with_kana: bool) -> Value {
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        "index".into(),
+        json!({
+            "type": "integer",
+            "description": "The unchanged index supplied with the candidate."
+        }),
+    );
+    properties.insert(
+        "text".into(),
+        json!({
+            "type": "string",
+            "description": "A concise dictionary-style translation."
+        }),
+    );
+    let mut required = vec!["index", "text"];
+    if with_kana {
+        properties.insert(
+            "reading".into(),
+            json!({
+                "type": "string",
+                "description": "The complete pronunciation of the Japanese translation in hiragana, without romaji."
+            }),
+        );
+        required.push("reading");
+    }
+    json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "candidate_translations",
+            "strict": true,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "translations": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": properties,
+                            "required": required,
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["translations"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+fn translate_attempt(
+    config: &Config,
+    target: &str,
+    items: &[JobItem],
+    structured_output: bool,
+) -> Result<Vec<(u32, String, String)>, AttemptError> {
+    if !config.ready() {
+        return Err(AttemptError::Other(
+            "translation API is not fully configured".into(),
+        ));
+    }
+    let endpoint = validate_url(&config.base_url).map_err(AttemptError::Other)?;
     let candidates: Vec<_> = items
         .iter()
         .map(|item| json!({"index": item.index, "text": item.source}))
         .collect();
-    let system = format!(
-        "Translate each Simplified Chinese input-method candidate into {target}. Return concise dictionary-style translations, no explanations. Respond with JSON only using {{\"translations\":[{{\"index\":0,\"text\":\"...\"}}]}}. Preserve every supplied index."
+    let with_kana = target == "JapaneseWithKana";
+    let target_name = if with_kana { "Japanese" } else { target };
+    let schema = if with_kana {
+        r#"{"translations":[{"index":0,"text":"日本語訳","reading":"にほんごやく"}]}"#
+    } else {
+        r#"{"translations":[{"index":0,"text":"..."}]}"#
+    };
+    let reading_instruction = if with_kana {
+        " For every Japanese translation, include its complete pronunciation in hiragana in the reading field. Do not use romaji."
+    } else {
+        ""
+    };
+    let semantic_instruction = format!(
+        "Translate each Simplified Chinese input-method candidate into {target_name}. Return concise dictionary-style translations, no explanations.{reading_instruction} Preserve every supplied index."
     );
-    let body = json!({
+    let system = if structured_output {
+        semantic_instruction
+    } else {
+        format!("{semantic_instruction} Respond with JSON only using {schema}.")
+    };
+    let mut body = json!({
         "model": config.model,
         "messages": [
             {"role": "system", "content": system},
@@ -368,34 +539,56 @@ fn translate(
         ],
         "stream": false
     });
+    if structured_output {
+        body["response_format"] = structured_output_format(with_kana);
+    }
+    if !config.reasoning_effort.is_empty() {
+        body["reasoning_effort"] = Value::String(config.reasoning_effort.clone());
+    }
     let client = Client::builder()
         .connect_timeout(config.timeout.min(Duration::from_secs(2)))
         .timeout(config.timeout)
         .build()
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| AttemptError::Other(error.to_string()))?;
     let response = client
         .post(endpoint)
         .bearer_auth(&config.api_key)
         .json(&body)
         .send()
-        .map_err(|error| format!("translation request failed: {error}"))?;
+        .map_err(|error| AttemptError::Other(format!("translation request failed: {error}")))?;
     let status = response.status();
+    let response_body = response
+        .text()
+        .map_err(|error| AttemptError::Other(format!("failed to read response: {error}")))?;
     if !status.is_success() {
-        return Err(format!("translation service returned HTTP {status}"));
+        let lower = response_body.to_ascii_lowercase();
+        let format_rejected = structured_output
+            && matches!(status.as_u16(), 400 | 404 | 405 | 415 | 422)
+            && (lower.contains("response_format")
+                || lower.contains("json_schema")
+                || lower.contains("structured output")
+                || lower.contains("structured_output"));
+        let message = format!("translation service returned HTTP {status}");
+        if format_rejected {
+            return Err(AttemptError::StructuredOutputUnsupported);
+        }
+        return Err(AttemptError::Other(message));
     }
-    let payload: Value = response
-        .json()
-        .map_err(|error| format!("invalid chat completion JSON: {error}"))?;
+    let payload: Value = serde_json::from_str(&response_body)
+        .map_err(|error| AttemptError::Other(format!("invalid chat completion JSON: {error}")))?;
     let content = payload
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
-        .ok_or_else(|| "chat completion did not contain message content".to_string())?;
-    parse_translations(content, items)
+        .ok_or_else(|| {
+            AttemptError::Other("chat completion did not contain message content".to_string())
+        })?;
+    parse_translations(content, items, with_kana).map_err(AttemptError::Other)
 }
 
 fn parse_translations(
     content: &str,
     items: &[JobItem],
+    with_kana: bool,
 ) -> Result<Vec<(u32, String, String)>, String> {
     let start = content
         .find('{')
@@ -427,9 +620,25 @@ fn parse_translations(
         let Some(raw) = value.get("text").and_then(Value::as_str) else {
             continue;
         };
-        let text = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut text = raw.split_whitespace().collect::<Vec<_>>().join(" ");
         if text.is_empty() || text.chars().count() > 256 {
             continue;
+        }
+        if with_kana {
+            let reading = value
+                .get("reading")
+                .and_then(Value::as_str)
+                .map(|reading| reading.split_whitespace().collect::<Vec<_>>().join(""))
+                .filter(|reading| {
+                    !reading.is_empty()
+                        && reading.chars().count() <= 256
+                        && is_kana_reading(reading)
+                });
+            if let Some(reading) = reading.filter(|reading| reading != &text) {
+                text.push('（');
+                text.push_str(&reading);
+                text.push('）');
+            }
         }
         output.push((index, (*source).to_string(), text));
     }
@@ -437,6 +646,15 @@ fn parse_translations(
         return Err("translation JSON contained no usable translations".into());
     }
     Ok(output)
+}
+
+fn is_kana_reading(reading: &str) -> bool {
+    reading.chars().all(|character| {
+        matches!(
+            character as u32,
+            0x3040..=0x30ff | 0x31f0..=0x31ff | 0x3000..=0x303f
+        ) || matches!(character, '-' | '・' | '＝')
+    })
 }
 
 unsafe fn cstr(ptr: *const c_char) -> String {
@@ -459,6 +677,7 @@ pub unsafe extern "C" fn ct_configure(
     base_url: *const c_char,
     model: *const c_char,
     api_key: *const c_char,
+    reasoning_effort: *const c_char,
     timeout_ms: u64,
     debounce_ms: u64,
     cache_entries: usize,
@@ -473,6 +692,7 @@ pub unsafe extern "C" fn ct_configure(
         base_url: unsafe { cstr(base_url) },
         model: unsafe { cstr(model) },
         api_key: unsafe { cstr(api_key) },
+        reasoning_effort: unsafe { cstr(reasoning_effort) },
         timeout: Duration::from_millis(timeout_ms.clamp(500, 15_000)),
         debounce: Duration::from_millis(debounce_ms.clamp(0, 2_000)),
         cache_entries: cache_entries.min(100_000),
@@ -671,7 +891,7 @@ pub extern "C" fn ct_shutdown() {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;
 
     unsafe extern "C" {
@@ -691,11 +911,58 @@ mod tests {
         ]
     }
 
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let header_end;
+        loop {
+            let size = stream.read(&mut buffer).unwrap();
+            request.extend_from_slice(&buffer[..size]);
+            if let Some(pos) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                header_end = pos + 4;
+                break;
+            }
+        }
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length: ")
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+            })
+            .unwrap();
+        while request.len() < header_end + content_length {
+            let size = stream.read(&mut buffer).unwrap();
+            request.extend_from_slice(&buffer[..size]);
+        }
+        String::from_utf8(request).unwrap()
+    }
+
+    fn request_json(request: &str) -> Value {
+        serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
+    }
+
+    fn write_json_response(stream: &mut TcpStream, status: &str, payload: &Value) {
+        let payload = serde_json::to_string(payload).unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            payload.len(),
+            payload
+        )
+        .unwrap();
+    }
+
     #[test]
     fn parses_json_and_code_fences() {
         let result = parse_translations(
             "```json\n{\"translations\":[{\"index\":0,\"text\":\"recite words\"},{\"index\":2,\"text\":\"bed sheet\"}]}\n```",
             &items(),
+            false,
         )
         .unwrap();
         assert_eq!(result[0], (0, "背单词".into(), "recite words".into()));
@@ -708,6 +975,7 @@ mod tests {
             parse_translations(
                 "{\"translations\":[{\"index\":9,\"text\":\"wrong\"}]}",
                 &items(),
+                false,
             )
             .is_err()
         );
@@ -750,46 +1018,15 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 4096];
-            let header_end;
-            loop {
-                let size = stream.read(&mut buffer).unwrap();
-                request.extend_from_slice(&buffer[..size]);
-                if let Some(pos) = request.windows(4).position(|part| part == b"\r\n\r\n") {
-                    header_end = pos + 4;
-                    break;
-                }
-            }
-            let headers = String::from_utf8_lossy(&request[..header_end]);
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    line.to_ascii_lowercase()
-                        .strip_prefix("content-length: ")
-                        .and_then(|value| value.trim().parse::<usize>().ok())
-                })
-                .unwrap();
-            while request.len() < header_end + content_length {
-                let size = stream.read(&mut buffer).unwrap();
-                request.extend_from_slice(&buffer[..size]);
-            }
-            sender.send(String::from_utf8(request).unwrap()).unwrap();
-            let content = "{\"translations\":[{\"index\":0,\"text\":\"単語を暗記する\"},{\"index\":2,\"text\":\"シーツ\"}]}";
-            let payload = serde_json::to_string(&json!({
-                "choices": [{"message": {"content": content}}]
-            }))
-            .unwrap();
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                payload.len(),
-                payload
-            )
-            .unwrap();
+            sender.send(read_http_request(&mut stream)).unwrap();
+            let content = "{\"translations\":[{\"index\":0,\"text\":\"単語を暗記する\",\"reading\":\"たんごをあんきする\"},{\"index\":2,\"text\":\"シーツ\",\"reading\":\"しーつ\"}]}";
+            write_json_response(
+                &mut stream,
+                "200 OK",
+                &json!({
+                    "choices": [{"message": {"content": content}}]
+                }),
+            );
         });
 
         let config = Config {
@@ -797,11 +1034,20 @@ mod tests {
             base_url: format!("http://{address}/v1"),
             model: "test-model".into(),
             api_key: "secret-token".into(),
+            reasoning_effort: "none".into(),
             timeout: Duration::from_secs(2),
             ..Config::default()
         };
-        let output = translate(&config, "Japanese", &items()).unwrap();
-        assert_eq!(output[0], (0, "背单词".into(), "単語を暗記する".into()));
+        let batch = translate_with_fallback(&config, "JapaneseWithKana", &items(), true).unwrap();
+        let output = batch.translations;
+        assert_eq!(
+            output[0],
+            (
+                0,
+                "背单词".into(),
+                "単語を暗記する（たんごをあんきする）".into()
+            )
+        );
         let request = receiver.recv().unwrap();
         assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
         assert!(
@@ -811,7 +1057,87 @@ mod tests {
         );
         assert!(request.contains("test-model"));
         assert!(request.contains("Japanese"));
+        let body = request_json(&request);
+        assert_eq!(body["reasoning_effort"], "none");
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(
+            body["response_format"]["json_schema"]["schema"]["properties"]["translations"]["items"]
+                ["required"],
+            json!(["index", "text", "reading"])
+        );
+        assert!(
+            !body["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Respond with JSON")
+        );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn falls_back_when_backend_rejects_json_schema() {
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("failed to bind mock HTTP server: {error}"),
+        };
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            sender.send(read_http_request(&mut first)).unwrap();
+            write_json_response(
+                &mut first,
+                "400 Bad Request",
+                &json!({"error": {"message": "response_format json_schema is not supported"}}),
+            );
+
+            let (mut second, _) = listener.accept().unwrap();
+            sender.send(read_http_request(&mut second)).unwrap();
+            let content = "{\"translations\":[{\"index\":0,\"text\":\"recite words\"},{\"index\":2,\"text\":\"bed sheet\"}]}";
+            write_json_response(
+                &mut second,
+                "200 OK",
+                &json!({"choices": [{"message": {"content": content}}]}),
+            );
+        });
+
+        let config = Config {
+            enabled: true,
+            base_url: format!("http://{address}/v1"),
+            model: "legacy-model".into(),
+            api_key: "secret-token".into(),
+            timeout: Duration::from_secs(2),
+            ..Config::default()
+        };
+        let batch = translate_with_fallback(&config, "English", &items(), true).unwrap();
+        assert!(batch.structured_output_unsupported);
+        assert_eq!(batch.translations[0].2, "recite words");
+
+        let first = request_json(&receiver.recv().unwrap());
+        let second = request_json(&receiver.recv().unwrap());
+        assert_eq!(first["response_format"]["type"], "json_schema");
+        assert!(second.get("response_format").is_none());
+        assert!(
+            second["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Respond with JSON")
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn formats_valid_kana_reading_and_ignores_invalid_reading() {
+        let result = parse_translations(
+            "{\"translations\":[{\"index\":0,\"text\":\"暗記する\",\"reading\":\"あんきする\"},{\"index\":2,\"text\":\"シーツ\",\"reading\":\"sheet\"}]}",
+            &items(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(result[0].2, "暗記する（あんきする）");
+        assert_eq!(result[1].2, "シーツ");
     }
 
     #[test]
