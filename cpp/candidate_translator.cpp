@@ -1,10 +1,10 @@
 #include "translator_ffi.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -108,7 +108,8 @@ struct CallbackResult {
 
 class CandidateTranslatorAddon;
 struct CallbackContext {
-    std::atomic<CandidateTranslatorAddon *> addon{nullptr};
+    std::mutex mutex;
+    CandidateTranslatorAddon *addon = nullptr;
 };
 
 bool containsCandidate(const std::shared_ptr<fcitx::CandidateList> &list,
@@ -179,7 +180,7 @@ class CandidateTranslatorAddon final
 public:
     explicit CandidateTranslatorAddon(fcitx::Instance *instance)
         : instance_(instance), callbackContext_(std::make_unique<CallbackContext>()) {
-        callbackContext_->addon.store(this);
+        callbackContext_->addon = this;
         reloadConfig();
         handlers_.emplace_back(instance_->watchEvent(
             fcitx::EventType::InputContextUpdateUI,
@@ -200,7 +201,10 @@ public:
     }
 
     ~CandidateTranslatorAddon() override {
-        callbackContext_->addon.store(nullptr);
+        {
+            std::lock_guard lock(callbackContext_->mutex);
+            callbackContext_->addon = nullptr;
+        }
         restoreAll();
         ct_shutdown();
     }
@@ -250,8 +254,9 @@ private:
         }
         ct_result_free(result);
         auto *context = static_cast<CallbackContext *>(userData);
-        if (auto *addon = context->addon.load()) {
-            addon->receiveResult(std::move(copied));
+        std::lock_guard lock(context->mutex);
+        if (context->addon) {
+            context->addon->receiveResult(std::move(copied));
         }
     }
 
