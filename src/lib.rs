@@ -524,7 +524,7 @@ fn translate_attempt(
         ""
     };
     let semantic_instruction = format!(
-        "Translate each Simplified Chinese input-method candidate into {target_name}. Return concise dictionary-style translations, no explanations.{reading_instruction} Preserve every supplied index."
+        "Translate each Simplified Chinese input-method candidate into {target_name}. Return concise dictionary-style translations, no explanations. Put every translation in a field named text.{reading_instruction} Preserve every supplied index."
     );
     let system = if structured_output {
         semantic_instruction
@@ -677,7 +677,11 @@ fn parse_translations(
         let Some(source) = sources.get(&index) else {
             continue;
         };
-        let Some(raw) = value.get("text").and_then(Value::as_str) else {
+        let Some(raw) = value
+            .get("text")
+            .or_else(|| value.get("translation"))
+            .and_then(Value::as_str)
+        else {
             continue;
         };
         let mut text = raw.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1045,6 +1049,18 @@ mod tests {
                 "単語を覚える（たんごをおぼえる）".into()
             )
         );
+    }
+
+    #[test]
+    fn accepts_translation_field_from_schema_ignoring_backend() {
+        let result = parse_translations(
+            r#"[{"index":0,"translation":"日本","reading":"にほん"},{"index":2,"translation":"日","reading":"ひ"}]"#,
+            &items(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(result[0], (0, "背单词".into(), "日本（にほん）".into()));
+        assert_eq!(result[1], (2, "被单".into(), "日（ひ）".into()));
     }
 
     #[test]
