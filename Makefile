@@ -2,7 +2,7 @@ PREFIX ?= /usr
 LIBDIR ?= $(PREFIX)/lib
 DESTDIR ?=
 
-.PHONY: build test install uninstall
+.PHONY: build test install uninstall build-macos test-macos package-macos
 
 build:
 	cargo build --release --locked
@@ -19,3 +19,12 @@ install: build
 uninstall:
 	rm -f $(DESTDIR)$(LIBDIR)/fcitx5/libfcitx5-candidate-translator.so
 	rm -f $(DESTDIR)$(PREFIX)/share/fcitx5/addon/candidate-translator.conf
+
+build-macos:
+	./scripts/macos.sh build
+
+test-macos:
+	./scripts/macos.sh test
+
+package-macos:
+	./scripts/macos.sh package

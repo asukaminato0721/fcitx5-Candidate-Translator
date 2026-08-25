@@ -6,9 +6,9 @@
 
 ![](./Screenshot.png)
 
-当前版本针对 fcitx5 5.1.x、`shuangpin` 输入法和 OpenAI Chat Completions 兼容接口。候选翻译会发送到你配置的远程服务；密码和敏感输入框不会发送请求。
+当前版本支持 Linux 上的 fcitx5 5.1.x，以及 macOS 13.3+ 上的 [fcitx5-macos](https://github.com/fcitx/fcitx5-macos)。插件针对 `shuangpin` 输入法和 OpenAI Chat Completions 兼容接口；它不支持 macOS 自带的拼音输入法。候选翻译会发送到你配置的远程服务；密码和敏感输入框不会发送请求。
 
-## 构建与安装
+## Linux 构建与安装
 
 需要 Rust、C++20 编译器、`pkg-config`、fcitx5 开发文件以及网络请求所需的 TLS 根证书。
 
@@ -33,9 +33,36 @@ sudo make uninstall
 fcitx5 -r
 ```
 
+## macOS 构建与安装
+
+macOS 版本需要 macOS 13.3+、Rust、Xcode Command Line Tools，以及已经安装的 fcitx5-macos。下面的命令会优先使用 `/Library/Input Methods/Fcitx5.app/Contents` 中的开发文件；如果安装包不包含开发文件，会自动把官方对应架构的开发包下载到 `target/fcitx5-macos-dev`：
+
+```bash
+make test-macos
+make package-macos
+```
+
+Apple Silicon 会生成：
+
+```text
+target/macos-package/candidate-translator-arm64.tar.bz2
+```
+
+打开 Fcitx5 的“插件管理器 / Plugin Manager”，选择“手动安装 / Install manually”并选择上述文件。插件管理器会将插件安装到 `~/Library/fcitx5` 并重启 Fcitx5。Intel Mac 的包名为 `candidate-translator-x86_64.tar.bz2`。
+
+可以显式指定目标架构、SDK 或 fcitx5-macos 发布版本：
+
+```bash
+MACOS_ARCH=x86_64 make package-macos
+FCITX5_MACOS_ROOT='/path/to/Fcitx5.app/Contents' make build-macos
+FCITX5_MACOS_RELEASE=0.3.4 make package-macos
+```
+
+交叉构建前需要安装对应的 Rust target，例如 `rustup target add x86_64-apple-darwin`。
+
 ## 配置
 
-打开 `fcitx5-configtool`，返回主界面的“附加组件 / Addons”，搜索“候选词翻译 / Candidate Translator”并点击设置按钮。翻译配置属于独立附加组件，不会出现在“双拼”输入法自身的配置页中。
+Linux 上打开 `fcitx5-configtool`，返回主界面的“附加组件 / Addons”，搜索“候选词翻译 / Candidate Translator”并点击设置按钮。macOS 上在 Fcitx5 设置中打开同名附加组件。翻译配置属于独立附加组件，不会出现在“双拼”输入法自身的配置页中。
 
 填写：
 
@@ -72,4 +99,12 @@ cargo fmt --all -- --check
 cargo test --locked
 cargo build --release --locked
 nm -D target/release/libfcitx5_candidate_translator.so | grep fcitx_addon_factory_instance
+```
+
+macOS 检查：
+
+```bash
+make test-macos
+make package-macos
+tar tjf target/macos-package/candidate-translator-$(uname -m).tar.bz2
 ```
