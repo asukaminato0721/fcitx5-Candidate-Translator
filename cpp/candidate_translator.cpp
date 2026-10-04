@@ -1,11 +1,11 @@
-#include "translator_ffi.h"
+#include "fcitx5-candidate-translator/src/bridge.rs.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
-#include <mutex>
 #include <string>
+#include <stdexcept>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -18,7 +18,7 @@
 #include <fcitx-utils/i18n.h>
 #include <fcitx-utils/log.h>
 #include <fcitx-utils/standardpaths.h>
-#include <fcitx-utils/trackableobject.h>
+#include <fcitx-utils/event.h>
 #include <fcitx/addonfactory.h>
 #include <fcitx/addoninstance.h>
 #include <fcitx/addonmanager.h>
@@ -31,6 +31,8 @@
 #include <fcitx/userinterface.h>
 
 namespace {
+
+namespace backend = candidate_translator;
 
 constexpr char kConfigPath[] = "conf/candidate-translator.conf";
 
@@ -83,18 +85,6 @@ struct PendingRequest {
     std::string signature;
 };
 
-struct CallbackResult {
-    std::uint64_t requestId;
-    std::vector<std::pair<std::uint32_t, std::string>> translations;
-    std::string error;
-};
-
-class CandidateTranslatorAddon;
-struct CallbackContext {
-    std::mutex mutex;
-    CandidateTranslatorAddon *addon = nullptr;
-};
-
 bool containsHan(std::string_view text) {
     for (std::size_t offset = 0; offset < text.size();) {
         const auto first = static_cast<unsigned char>(text[offset]);
@@ -136,13 +126,21 @@ std::size_t utf8Characters(std::string_view text) {
     });
 }
 
-class CandidateTranslatorAddon final
-    : public fcitx::AddonInstance,
-      public fcitx::TrackableObject<CandidateTranslatorAddon> {
+class CandidateTranslatorAddon final : public fcitx::AddonInstance {
 public:
     explicit CandidateTranslatorAddon(fcitx::Instance *instance)
-        : instance_(instance), callbackContext_(std::make_unique<CallbackContext>()) {
-        callbackContext_->addon = this;
+        : instance_(instance), translator_(backend::new_translator()) {
+        resultEvent_ = instance_->eventLoop().addIOEvent(
+            translator_->result_fd(), fcitx::IOEventFlag::In,
+            [this](fcitx::EventSourceIO *, int, fcitx::IOEventFlags) {
+                for (auto &result : translator_->take_results()) {
+                    applyResult(std::move(result));
+                }
+                return true;
+            });
+        if (!resultEvent_) {
+            throw std::runtime_error("Failed to watch translator results");
+        }
         reloadConfig();
         outputConnection_ = instance_->connect<fcitx::Instance::OutputFilter>(
             [this](fcitx::InputContext *inputContext, fcitx::Text &text) {
@@ -167,12 +165,10 @@ public:
     }
 
     ~CandidateTranslatorAddon() override {
-        {
-            std::lock_guard lock(callbackContext_->mutex);
-            callbackContext_->addon = nullptr;
-        }
+        // Unregister the borrowed fd before Translator joins its worker and
+        // closes the sockets. Background work never accesses this addon.
+        resultEvent_.reset();
         clearAll();
-        ct_shutdown();
     }
 
     const fcitx::Configuration *getConfig() const override { return &config_; }
@@ -181,7 +177,7 @@ public:
         clearAll();
         config_.load(rawConfig, true);
         if (*config_.clearCache) {
-            ct_clear_cache();
+            translator_->clear_cache();
             config_.clearCache.setValue(false);
         }
         fcitx::safeSaveAsIni(config_, kConfigPath);
@@ -194,38 +190,7 @@ public:
         configureBackend();
     }
 
-    void receiveResult(CallbackResult result) {
-        auto reference = watch();
-        instance_->eventDispatcher().scheduleWithContext(
-            reference, [this, result = std::move(result)]() mutable {
-                applyResult(std::move(result));
-            });
-    }
-
 private:
-    static void rustCallback(void *userData, std::uint64_t requestId,
-                             CtResult *result) {
-        CallbackResult copied{.requestId = requestId,
-                              .translations = {},
-                              .error = {}};
-        const auto length = ct_result_len(result);
-        copied.translations.reserve(length);
-        for (std::size_t index = 0; index < length; ++index) {
-            const auto *text = ct_result_text(result, index);
-            copied.translations.emplace_back(
-                ct_result_index(result, index), text ? text : "");
-        }
-        if (const auto *error = ct_result_error(result); error) {
-            copied.error = error;
-        }
-        ct_result_free(result);
-        auto *context = static_cast<CallbackContext *>(userData);
-        std::lock_guard lock(context->mutex);
-        if (context->addon) {
-            context->addon->receiveResult(std::move(copied));
-        }
-    }
-
     std::string targetLanguage() const {
         if (*config_.targetLanguage != TargetLanguage::Japanese) {
             return "English";
@@ -261,11 +226,18 @@ private:
         const auto dictionaryPath = fcitx::StandardPaths::global().locate(
             fcitx::StandardPathsType::PkgData,
             "candidate-translator/cedict_ts.csv");
-        ct_configure(*config_.enabled, config_.baseUrl->c_str(),
-                     config_.model->c_str(), config_.apiKey->c_str(),
-                     reasoning.c_str(), dictionaryPath.c_str(),
-                     *config_.requestTimeoutMs, *config_.debounceMs,
-                     *config_.cacheEntries, cachePath.c_str());
+        translator_->configure(backend::BackendConfig{
+            .enabled = *config_.enabled,
+            .base_url = *config_.baseUrl,
+            .model = *config_.model,
+            .api_key = *config_.apiKey,
+            .reasoning_effort = reasoning,
+            .dictionary_path = dictionaryPath.string(),
+            .timeout_ms = static_cast<std::uint64_t>(*config_.requestTimeoutMs),
+            .debounce_ms = static_cast<std::uint64_t>(*config_.debounceMs),
+            .cache_entries = static_cast<std::size_t>(*config_.cacheEntries),
+            .cache_path = cachePath.string(),
+        });
         const auto configPath =
             fcitx::StandardPaths::global()
                 .userDirectory(fcitx::StandardPathsType::Config) /
@@ -274,6 +246,7 @@ private:
     }
 
     void clearAll() {
+        translator_->cancel_requests();
         contexts_.clear();
         pending_.clear();
     }
@@ -326,8 +299,7 @@ private:
 
         std::string signature = targetLanguage();
         state.translations.clear();
-        std::vector<std::uint32_t> missingIndices;
-        std::vector<std::string> missingSources;
+        rust::Vec<backend::Candidate> missing;
         for (int index = 0; index < list->size(); ++index) {
             const auto &word = list->candidate(index);
             const auto source = word.text().toStringForCommit();
@@ -336,13 +308,12 @@ private:
                 word.isPlaceHolder()) {
                 continue;
             }
-            char *cached = ct_lookup(targetLanguage().c_str(), source.c_str());
-            if (cached) {
-                state.translations.insert_or_assign(source, cached);
-                ct_string_free(cached);
-            } else {
-                missingIndices.push_back(static_cast<std::uint32_t>(index));
-                missingSources.push_back(source);
+            auto cached = translator_->lookup(targetLanguage(), source);
+            if (!cached.empty()) {
+                state.translations.insert_or_assign(source, std::string(cached));
+            } else if (missing.size() < 64) {
+                missing.push_back(backend::Candidate{
+                    .index = static_cast<std::uint32_t>(index), .source = source});
             }
         }
         if (state.signature != signature && state.currentRequest != 0) {
@@ -350,7 +321,7 @@ private:
             state.currentRequest = 0;
         }
         state.signature = signature;
-        if (missingIndices.empty() || state.currentRequest != 0) {
+        if (missing.empty() || state.currentRequest != 0) {
             return;
         }
 
@@ -358,19 +329,11 @@ private:
         state.currentRequest = requestId;
         pending_.emplace(requestId,
                          PendingRequest{inputContext, list, signature});
-        std::vector<const char *> sourcePointers;
-        sourcePointers.reserve(missingSources.size());
-        for (const auto &source : missingSources) {
-            sourcePointers.push_back(source.c_str());
-        }
-        const auto target = targetLanguage();
-        ct_submit(requestId, target.c_str(), missingIndices.data(),
-                  sourcePointers.data(), sourcePointers.size(),
-                  callbackContext_.get(), &CandidateTranslatorAddon::rustCallback);
+        translator_->submit(requestId, targetLanguage(), std::move(missing));
     }
 
-    void applyResult(CallbackResult result) {
-        auto pending = pending_.find(result.requestId);
+    void applyResult(backend::TranslationResult result) {
+        auto pending = pending_.find(result.request_id);
         if (pending == pending_.end()) {
             return;
         }
@@ -389,7 +352,7 @@ private:
         }
         if (!result.error.empty()) {
             if (result.error != "translation request was superseded") {
-                FCITX_WARN() << "Candidate translation failed: " << result.error;
+                FCITX_WARN() << "Candidate translation failed: " << std::string(result.error);
             }
             return;
         }
@@ -401,7 +364,7 @@ private:
             const auto &word =
                 currentList->candidate(static_cast<int>(index));
             state.translations.insert_or_assign(
-                word.text().toStringForCommit(), translation);
+                word.text().toStringForCommit(), std::string(translation));
         }
         request.inputContext->updateUserInterface(
             fcitx::UserInterfaceComponent::InputPanel);
@@ -415,7 +378,9 @@ private:
     std::unordered_map<fcitx::InputContext *, ContextState> contexts_;
     std::unordered_map<std::uint64_t, PendingRequest> pending_;
     std::uint64_t nextRequestId_ = 1;
-    std::unique_ptr<CallbackContext> callbackContext_;
+    rust::Box<backend::Translator> translator_;
+    // Destruction order matters: the watcher must die before its borrowed fd.
+    std::unique_ptr<fcitx::EventSourceIO> resultEvent_;
 };
 
 class CandidateTranslatorFactory final : public fcitx::AddonFactory {
@@ -427,14 +392,38 @@ public:
 
 } // namespace
 
-extern "C" bool ct_cpp_self_test() {
+bool candidate_translator::cpp_self_test() {
     fcitx::Text display("candidate");
     display.append("  ");
     display.append("translation", fcitx::TextFormatFlag::Italic);
     return display.toString() == "candidate  translation";
 }
 
-extern "C" fcitx::AddonFactory *ct_cpp_addon_factory_instance() {
+rust::Vec<candidate_translator::TranslationResult>
+candidate_translator::cpp_wait_for_results(const Translator &translator) {
+    fcitx::EventLoop loop;
+    rust::Vec<TranslationResult> results;
+    auto watcher = loop.addIOEvent(
+        translator.result_fd(), fcitx::IOEventFlag::In,
+        [&](fcitx::EventSourceIO *, int, fcitx::IOEventFlags) {
+            results = translator.take_results();
+            loop.exit();
+            return true;
+        });
+    auto timeout = loop.addTimeEvent(
+        CLOCK_MONOTONIC, fcitx::now(CLOCK_MONOTONIC) + 5'000'000, 0,
+        [&](fcitx::EventSourceTime *, std::uint64_t) {
+            loop.exit();
+            return false;
+        });
+    if (!watcher || !timeout) {
+        return results;
+    }
+    loop.exec();
+    return results;
+}
+
+fcitx::AddonFactory *candidate_translator::addon_factory() {
     static CandidateTranslatorFactory factory;
     return &factory;
 }

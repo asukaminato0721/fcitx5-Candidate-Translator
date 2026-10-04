@@ -54,14 +54,19 @@ fn require_macos_fcitx_version(root: &Path) {
 
 fn main() {
     println!("cargo:rerun-if-changed=cpp/candidate_translator.cpp");
-    println!("cargo:rerun-if-changed=cpp/translator_ffi.h");
+    println!("cargo:rerun-if-changed=cpp/bridge.h");
     println!("cargo:rerun-if-changed=data/candidate-translator.conf");
+    println!("cargo:rerun-if-changed=src/bridge.rs");
 
     // Compiler caches do not necessarily hash native archives supplied to
     // rustc. Add the native source content to rustc's arguments so changing
     // the bridge can never reuse a stale cdylib link result.
     let mut source_hash = std::hash::DefaultHasher::new();
-    for path in ["cpp/candidate_translator.cpp", "cpp/translator_ffi.h"] {
+    for path in [
+        "cpp/candidate_translator.cpp",
+        "cpp/bridge.h",
+        "src/bridge.rs",
+    ] {
         std::fs::read(path)
             .expect("failed to read native bridge source")
             .hash(&mut source_hash);
@@ -111,7 +116,7 @@ fn main() {
         include_paths.extend(config.include_paths);
     }
 
-    let mut build = cc::Build::new();
+    let mut build = cxx_build::bridge("src/bridge.rs");
     build
         .cpp(true)
         .std("c++20")

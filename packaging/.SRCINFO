@@ -1,0 +1,19 @@
+pkgbase = fcitx5-candidate-translator
+	pkgdesc = Translate Fcitx5 candidates with an OpenAI-compatible API
+	pkgver = 0.1.0
+	pkgrel = 6
+	arch = x86_64
+	license = MIT
+	license = CC-BY-SA-4.0
+	makedepends = cargo
+	makedepends = gcc
+	makedepends = pkgconf
+	depends = fcitx5>=5.1.20
+	depends = gcc-libs
+	depends = glibc
+	depends = kakasi
+	options = !lto
+	source = cedict_ts.csv::https://raw.githubusercontent.com/code4fukui/MJdic/master/cedict_ts.csv
+	sha256sums = 23d94b2ee743662fd00cf0929caaf3f19362912f0765335a9d86816338388aef
+
+pkgname = fcitx5-candidate-translator

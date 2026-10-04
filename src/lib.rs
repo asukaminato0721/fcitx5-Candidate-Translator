@@ -2,30 +2,30 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
-use std::ffi::{CStr, CString, c_char, c_void};
+use std::ffi::c_void;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::ptr;
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use url::Url;
 
 const CACHE_VERSION: u32 = 1;
 
-unsafe extern "C" {
-    fn ct_cpp_addon_factory_instance() -> *mut c_void;
-}
+mod bridge;
+use bridge::ffi::{BackendConfig, Candidate as JobItem, Translation, TranslationResult};
 
 // Rust cdylibs export Rust ABI entrypoints through a generated version script.
 // Forward the loader symbol explicitly so the C++ factory remains visible to
 // Fcitx's dlsym-based addon loader.
 #[unsafe(no_mangle)]
 pub extern "C" fn fcitx_addon_factory_instance() -> *mut c_void {
-    unsafe { ct_cpp_addon_factory_instance() }
+    bridge::ffi::addon_factory().cast()
 }
 
 #[derive(Clone, Debug, Default)]
@@ -51,22 +51,12 @@ impl Config {
     }
 }
 
-#[derive(Clone, Debug)]
-struct JobItem {
-    index: u32,
-    source: String,
-}
-
-#[derive(Clone)]
 struct Job {
     request_id: u64,
     target: String,
     items: Vec<JobItem>,
-    user_data: usize,
-    callback: ResultCallback,
+    ready_at: Instant,
 }
-
-type ResultCallback = unsafe extern "C" fn(*mut c_void, u64, *mut CtResult);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CacheEntry {
@@ -375,74 +365,64 @@ struct State {
     cache: Cache,
     dictionary: ShortDictionary,
     pending: Option<Job>,
-    pending_generation: u64,
     stopping: bool,
+    epoch: u64,
+    results: Vec<TranslationResult>,
     cooldown_until: Option<Instant>,
     structured_output_unsupported: HashSet<String>,
 }
 
-struct Engine {
+pub struct Translator {
     shared: Arc<(Mutex<State>, Condvar)>,
-    worker: Mutex<Option<JoinHandle<()>>>,
+    worker: Option<JoinHandle<()>>,
+    receiver: UnixStream,
+    notifier: UnixStream,
 }
 
-impl Engine {
-    fn new() -> Self {
-        let shared = Arc::new((Mutex::new(State::default()), Condvar::new()));
-        let worker_shared = Arc::clone(&shared);
-        let worker = thread::Builder::new()
-            .name("fcitx5-translator".into())
-            .spawn(move || worker_loop(worker_shared))
-            .expect("failed to start translator worker");
-        Self {
-            shared,
-            worker: Mutex::new(Some(worker)),
+fn new_translator() -> std::io::Result<Box<Translator>> {
+    let (receiver, notifier) = UnixStream::pair()?;
+    receiver.set_nonblocking(true)?;
+    notifier.set_nonblocking(true)?;
+    let worker_notifier = notifier.try_clone()?;
+    let shared = Arc::new((Mutex::new(State::default()), Condvar::new()));
+    let worker_shared = Arc::clone(&shared);
+    let worker = thread::Builder::new()
+        .name("fcitx5-translator".into())
+        .spawn(move || worker_loop(worker_shared, worker_notifier))?;
+    Ok(Box::new(Translator {
+        shared,
+        worker: Some(worker),
+        receiver,
+        notifier,
+    }))
+}
+
+// Called while holding the state lock, after publishing a result. A full
+// nonblocking socket already has a wakeup pending, so notifications coalesce.
+fn notify(mut socket: &UnixStream) {
+    loop {
+        match socket.write(&[1]) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            _ => break,
         }
     }
+}
 
-    fn ensure_worker(&self) {
-        let mut worker = self
-            .worker
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if worker.is_some() {
-            return;
-        }
+impl Drop for Translator {
+    fn drop(&mut self) {
+        let (lock, condvar) = &*self.shared;
         {
-            let (lock, _) = &*self.shared;
             let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
-            state.stopping = false;
+            state.stopping = true;
+            state.pending = None;
+            condvar.notify_all();
         }
-        let shared = Arc::clone(&self.shared);
-        *worker = Some(
-            thread::Builder::new()
-                .name("fcitx5-translator".into())
-                .spawn(move || worker_loop(shared))
-                .expect("failed to restart translator worker"),
-        );
+        // Blocking HTTP attempts finish under their configured timeouts.
+        // Keep both socket endpoints alive until the worker has exited.
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
-}
-
-static ENGINE: OnceLock<Engine> = OnceLock::new();
-
-fn engine() -> &'static Engine {
-    ENGINE.get_or_init(Engine::new)
-}
-
-#[derive(Clone)]
-struct Translation {
-    index: u32,
-    text: CString,
-}
-
-#[repr(C)]
-pub struct CtResult {
-    translations: Vec<Translation>,
-    error: CString,
-}
-
-fn c_string(value: &str) -> CString {
-    CString::new(value.replace('\0', "")).unwrap_or_default()
 }
 
 fn cache_key(config: &Config, target: &str, source: &str) -> String {
@@ -481,40 +461,39 @@ enum AttemptError {
     Other(String),
 }
 
-fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>) {
+fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>, notifier: UnixStream) {
     let (lock, condvar) = &*shared;
     loop {
-        let (job, config) = {
+        let (job, config, epoch) = {
             let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
-            while state.pending.is_none() && !state.stopping {
-                state = condvar
-                    .wait(state)
-                    .unwrap_or_else(|error| error.into_inner());
-            }
-            if state.stopping {
-                return;
-            }
-
             loop {
-                let generation = state.pending_generation;
-                let debounce = state.config.debounce;
-                let (next, _) = condvar
-                    .wait_timeout(state, debounce)
-                    .unwrap_or_else(|error| error.into_inner());
-                state = next;
                 if state.stopping {
                     return;
                 }
-                if generation == state.pending_generation {
-                    break;
+                if let Some(job) = &state.pending {
+                    let remaining = job.ready_at.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    state = condvar
+                        .wait_timeout(state, remaining)
+                        .unwrap_or_else(|error| error.into_inner())
+                        .0;
+                } else {
+                    state = condvar
+                        .wait(state)
+                        .unwrap_or_else(|error| error.into_inner());
                 }
             }
-            let job = state.pending.take().expect("pending job disappeared");
-            (job, state.config.clone())
+            let job = state.pending.take().expect("pending job is ready");
+            (job, state.config.clone(), state.epoch)
         };
 
         let result = {
             let state = lock.lock().unwrap_or_else(|error| error.into_inner());
+            if state.stopping || state.epoch != epoch {
+                continue;
+            }
             if state
                 .cooldown_until
                 .is_some_and(|deadline| deadline > Instant::now())
@@ -532,13 +511,20 @@ fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>) {
             }
         };
 
-        let mut output = CtResult {
+        let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
+        if state.stopping {
+            return;
+        }
+        if state.epoch != epoch {
+            continue;
+        }
+        let mut output = TranslationResult {
+            request_id: job.request_id,
             translations: Vec::new(),
-            error: CString::default(),
+            error: String::new(),
         };
         match result {
             Ok(batch) => {
-                let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
                 state.cooldown_until = None;
                 if batch.structured_output_unsupported {
                     state
@@ -550,29 +536,23 @@ fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>) {
                 for (index, source, text) in batch.translations {
                     let key = cache_key(&config, &job.target, &source);
                     state.cache.put(key, text.clone(), cache_limit);
-                    output.translations.push(Translation {
-                        index,
-                        text: c_string(&text),
-                    });
+                    output.translations.push(Translation { index, text });
                 }
                 let _ = state.cache.save(&cache_path);
             }
             Err(error) => {
-                let mut state = lock.lock().unwrap_or_else(|poison| poison.into_inner());
                 if error.structured_output_unsupported {
                     state
                         .structured_output_unsupported
                         .insert(backend_key(&config));
                 }
                 state.cooldown_until = Some(Instant::now() + Duration::from_secs(5));
-                output.error = c_string(&error.message);
+                output.error = error.message;
             }
         }
 
-        let result = Box::into_raw(Box::new(output));
-        unsafe {
-            (job.callback)(job.user_data as *mut c_void, job.request_id, result);
-        }
+        state.results.push(output);
+        notify(&notifier);
     }
 }
 
@@ -921,239 +901,116 @@ fn is_kana_reading(reading: &str) -> bool {
     })
 }
 
-unsafe fn cstr(ptr: *const c_char) -> String {
-    if ptr.is_null() {
-        return String::new();
-    }
-    unsafe { CStr::from_ptr(ptr) }
-        .to_string_lossy()
-        .into_owned()
-}
-
-#[unsafe(no_mangle)]
-/// Configure the process-wide translator worker.
-///
-/// # Safety
-/// Every string pointer must be null or point to a valid NUL-terminated string
-/// for the duration of this call.
-pub unsafe extern "C" fn ct_configure(
-    enabled: bool,
-    base_url: *const c_char,
-    model: *const c_char,
-    api_key: *const c_char,
-    reasoning_effort: *const c_char,
-    dictionary_path: *const c_char,
-    timeout_ms: u64,
-    debounce_ms: u64,
-    cache_entries: usize,
-    cache_path: *const c_char,
-) {
-    let engine = engine();
-    engine.ensure_worker();
-    let (lock, condvar) = &*engine.shared;
-    let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
-    state.config = Config {
-        enabled,
-        base_url: unsafe { cstr(base_url) },
-        model: unsafe { cstr(model) },
-        api_key: unsafe { cstr(api_key) },
-        reasoning_effort: unsafe { cstr(reasoning_effort) },
-        dictionary_path: PathBuf::from(unsafe { cstr(dictionary_path) }),
-        timeout: Duration::from_millis(timeout_ms.clamp(500, 15_000)),
-        debounce: Duration::from_millis(debounce_ms.clamp(0, 2_000)),
-        cache_entries: cache_entries.min(100_000),
-        cache_path: PathBuf::from(unsafe { cstr(cache_path) }),
-    };
-    let path = state.config.cache_path.clone();
-    let limit = state.config.cache_entries;
-    state.cache.ensure_loaded(&path, limit);
-    let dictionary_path = state.config.dictionary_path.clone();
-    state.dictionary.ensure_loaded(&dictionary_path);
-    state.cooldown_until = None;
-    condvar.notify_all();
-}
-
-#[unsafe(no_mangle)]
-/// Return a Rust-allocated cached translation, or null on a cache miss.
-///
-/// # Safety
-/// Both arguments must be null or valid NUL-terminated strings. A non-null
-/// return value must be released exactly once with [`ct_string_free`].
-pub unsafe extern "C" fn ct_lookup(target: *const c_char, source: *const c_char) -> *mut c_char {
-    let engine = engine();
-    let (lock, _) = &*engine.shared;
-    let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
-    let target = unsafe { cstr(target) };
-    let source = unsafe { cstr(source) };
-    let key = cache_key(&state.config, &target, &source);
-    let translation = state
-        .cache
-        .get(&key)
-        .or_else(|| state.dictionary.lookup(&target, &source));
-    translation
-        .map(|text| c_string(&text).into_raw())
-        .unwrap_or(ptr::null_mut())
-}
-
-#[unsafe(no_mangle)]
-/// Queue an asynchronous translation request.
-///
-/// # Safety
-/// `indices` and `sources` must each reference `len` readable elements, every
-/// source must be a valid NUL-terminated string, and `user_data` must remain
-/// valid until the callback runs or [`ct_shutdown`] returns.
-pub unsafe extern "C" fn ct_submit(
-    request_id: u64,
-    target: *const c_char,
-    indices: *const u32,
-    sources: *const *const c_char,
-    len: usize,
-    user_data: *mut c_void,
-    callback: Option<ResultCallback>,
-) {
-    let Some(callback) = callback else { return };
-    if indices.is_null() || sources.is_null() || len == 0 || len > 64 {
-        return;
-    }
-    let indices = unsafe { std::slice::from_raw_parts(indices, len) };
-    let sources = unsafe { std::slice::from_raw_parts(sources, len) };
-    let items = indices
-        .iter()
-        .zip(sources)
-        .map(|(&index, &source)| JobItem {
-            index,
-            source: unsafe { cstr(source) },
-        })
-        .collect();
-    let job = Job {
-        request_id,
-        target: unsafe { cstr(target) },
-        items,
-        user_data: user_data as usize,
-        callback,
-    };
-    let engine = engine();
-    let (lock, condvar) = &*engine.shared;
-    let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
-    let replaced = state.pending.replace(job);
-    state.pending_generation = state.pending_generation.wrapping_add(1);
-    condvar.notify_all();
-    drop(state);
-    if let Some(replaced) = replaced {
-        let result = Box::into_raw(Box::new(CtResult {
-            translations: Vec::new(),
-            error: c_string("translation request was superseded"),
-        }));
-        unsafe {
-            (replaced.callback)(
-                replaced.user_data as *mut c_void,
-                replaced.request_id,
-                result,
-            );
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn ct_clear_cache() {
-    let engine = engine();
-    let (lock, _) = &*engine.shared;
-    let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
-    state.cache.entries.clear();
-    let path = state.config.cache_path.clone();
-    let _ = fs::remove_file(path);
-}
-
-#[unsafe(no_mangle)]
-/// Release a string returned by [`ct_lookup`].
-///
-/// # Safety
-/// `value` must be null or a pointer returned by [`ct_lookup`] that has not
-/// already been freed.
-pub unsafe extern "C" fn ct_string_free(value: *mut c_char) {
-    if !value.is_null() {
-        drop(unsafe { CString::from_raw(value) });
-    }
-}
-
-#[unsafe(no_mangle)]
-/// Return the number of translations stored in a callback result.
-///
-/// # Safety
-/// `result` must be null or a live result supplied to `ResultCallback`.
-pub unsafe extern "C" fn ct_result_len(result: *const CtResult) -> usize {
-    unsafe { result.as_ref() }
-        .map(|result| result.translations.len())
-        .unwrap_or(0)
-}
-
-#[unsafe(no_mangle)]
-/// Return the original candidate index at `pos`.
-///
-/// # Safety
-/// `result` must be a live callback result and `pos` should be smaller than
-/// [`ct_result_len`].
-pub unsafe extern "C" fn ct_result_index(result: *const CtResult, pos: usize) -> u32 {
-    unsafe { result.as_ref() }
-        .and_then(|result| result.translations.get(pos))
-        .map(|translation| translation.index)
-        .unwrap_or(u32::MAX)
-}
-
-#[unsafe(no_mangle)]
-/// Borrow the translated text at `pos`.
-///
-/// # Safety
-/// `result` must be a live callback result and the returned pointer must not be
-/// used after [`ct_result_free`].
-pub unsafe extern "C" fn ct_result_text(result: *const CtResult, pos: usize) -> *const c_char {
-    unsafe { result.as_ref() }
-        .and_then(|result| result.translations.get(pos))
-        .map(|translation| translation.text.as_ptr())
-        .unwrap_or(ptr::null())
-}
-
-#[unsafe(no_mangle)]
-/// Borrow the error message from a callback result.
-///
-/// # Safety
-/// `result` must be null or a live callback result and the returned pointer
-/// must not be used after [`ct_result_free`].
-pub unsafe extern "C" fn ct_result_error(result: *const CtResult) -> *const c_char {
-    unsafe { result.as_ref() }
-        .map(|result| result.error.as_ptr())
-        .unwrap_or(ptr::null())
-}
-
-#[unsafe(no_mangle)]
-/// Release a callback result and all strings owned by it.
-///
-/// # Safety
-/// `result` must be null or a live callback result that has not already been
-/// released.
-pub unsafe extern "C" fn ct_result_free(result: *mut CtResult) {
-    if !result.is_null() {
-        drop(unsafe { Box::from_raw(result) });
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn ct_shutdown() {
-    let Some(engine) = ENGINE.get() else { return };
-    let (lock, condvar) = &*engine.shared;
-    {
+impl Translator {
+    fn configure(&self, config: BackendConfig) {
+        let (lock, condvar) = &*self.shared;
         let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
-        state.stopping = true;
-        state.pending = None;
+        Self::invalidate(&mut state);
+        state.config = Config {
+            enabled: config.enabled,
+            base_url: config.base_url,
+            model: config.model,
+            api_key: config.api_key,
+            reasoning_effort: config.reasoning_effort,
+            dictionary_path: config.dictionary_path.into(),
+            timeout: Duration::from_millis(config.timeout_ms.clamp(500, 15_000)),
+            debounce: Duration::from_millis(config.debounce_ms.min(2_000)),
+            cache_entries: config.cache_entries.min(100_000),
+            cache_path: config.cache_path.into(),
+        };
+        let path = state.config.cache_path.clone();
+        let limit = state.config.cache_entries;
+        state.cache.ensure_loaded(&path, limit);
+        let dictionary_path = state.config.dictionary_path.clone();
+        state.dictionary.ensure_loaded(&dictionary_path);
+        state.cooldown_until = None;
         condvar.notify_all();
     }
-    if let Some(worker) = engine
-        .worker
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .take()
-    {
-        let _ = worker.join();
+
+    fn lookup(&self, target: &str, source: &str) -> String {
+        let (lock, _) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
+        let key = cache_key(&state.config, target, source);
+        state
+            .cache
+            .get(&key)
+            .or_else(|| state.dictionary.lookup(target, source))
+            .unwrap_or_default()
+    }
+
+    fn submit(&self, request_id: u64, target: &str, items: Vec<JobItem>) {
+        let (lock, condvar) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
+        if items.is_empty() || items.len() > 64 || !state.config.ready() {
+            state.results.push(TranslationResult {
+                request_id,
+                translations: Vec::new(),
+                error: "invalid translation request or incomplete configuration".into(),
+            });
+            notify(&self.notifier);
+            return;
+        }
+        let job = Job {
+            request_id,
+            target: target.into(),
+            items,
+            ready_at: Instant::now() + state.config.debounce,
+        };
+        if let Some(replaced) = state.pending.replace(job) {
+            state.results.push(TranslationResult {
+                request_id: replaced.request_id,
+                translations: Vec::new(),
+                error: "translation request was superseded".into(),
+            });
+            notify(&self.notifier);
+        }
+        condvar.notify_all();
+    }
+
+    // Callers discard their matching request bookkeeping when invalidating.
+    // In-flight responses must not repopulate the cache or result queue.
+    fn invalidate(state: &mut State) {
+        state.epoch = state.epoch.wrapping_add(1);
+        state.pending = None;
+        state.results.clear();
+    }
+
+    fn cancel_requests(&self) {
+        let (lock, condvar) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
+        Self::invalidate(&mut state);
+        condvar.notify_all();
+    }
+
+    fn clear_cache(&self) {
+        let (lock, condvar) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
+        Self::invalidate(&mut state);
+        state.cache.entries.clear();
+        let _ = fs::remove_file(&state.config.cache_path);
+        condvar.notify_all();
+    }
+
+    fn result_fd(&self) -> i32 {
+        self.receiver.as_raw_fd()
+    }
+
+    fn take_results(&self) -> Vec<TranslationResult> {
+        let (lock, _) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
+        // Drain notifications and results under the producer lock. A producer
+        // arriving after this drain always writes a fresh wakeup.
+        let mut receiver = &self.receiver;
+        let mut buffer = [0; 256];
+        loop {
+            match receiver.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(_) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        std::mem::take(&mut state.results)
     }
 }
 
@@ -1163,10 +1020,6 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;
-
-    unsafe extern "C" {
-        fn ct_cpp_self_test() -> bool;
-    }
 
     fn items() -> Vec<JobItem> {
         vec![
@@ -1225,6 +1078,188 @@ mod tests {
             payload
         )
         .unwrap();
+    }
+
+    fn backend_config(base_url: &str) -> BackendConfig {
+        BackendConfig {
+            enabled: true,
+            base_url: base_url.into(),
+            model: "test".into(),
+            api_key: "test-key".into(),
+            timeout_ms: 2_000,
+            cache_entries: 16,
+            ..BackendConfig::default()
+        }
+    }
+
+    fn translation_response(text: &str) -> Value {
+        json!({"choices": [{"message": {"content": json!({
+            "translations": [{"index": 0, "text": text}]
+        }).to_string()}}]})
+    }
+
+    #[test]
+    fn notifications_rearm_and_instances_are_independent() {
+        let first = new_translator().unwrap();
+        let second = new_translator().unwrap();
+        assert_ne!(first.result_fd(), second.result_fd());
+        // Incomplete configuration produces queued errors without networking.
+        for request_id in 1..=2 {
+            first.submit(request_id, "English", items());
+            let results = bridge::ffi::cpp_wait_for_results(&first);
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].request_id, request_id);
+            assert!(!results[0].error.is_empty());
+            assert!(first.take_results().is_empty());
+            assert!(second.take_results().is_empty());
+        }
+        drop(first);
+        second.submit(3, "English", items());
+        assert_eq!(bridge::ffi::cpp_wait_for_results(&second)[0].request_id, 3);
+    }
+
+    #[test]
+    fn full_notification_socket_does_not_block_or_lose_results() {
+        let translator = new_translator().unwrap();
+        // Fill the wakeup socket, then publish a result while it is full.
+        let mut socket = &translator.notifier;
+        loop {
+            match socket.write(&[1; 4096]) {
+                Ok(_) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("failed to fill notification socket: {error}"),
+            }
+        }
+        translator.submit(7, "English", items());
+        let results = bridge::ffi::cpp_wait_for_results(&translator);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].request_id, 7);
+        translator.submit(8, "English", items());
+        assert_eq!(
+            bridge::ffi::cpp_wait_for_results(&translator)[0].request_id,
+            8
+        );
+    }
+
+    #[test]
+    fn superseded_and_cancelled_requests_do_not_reach_the_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let translator = new_translator().unwrap();
+        let mut config = backend_config(&format!("http://{}", listener.local_addr().unwrap()));
+        config.debounce_ms = 2_000;
+        translator.configure(config);
+        translator.submit(1, "English", items());
+        translator.submit(2, "English", items());
+        let results = translator.take_results();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].request_id, 1);
+        assert!(results[0].error.contains("superseded"));
+        translator.cancel_requests();
+        assert!(translator.take_results().is_empty());
+        drop(translator);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn worker_results_cross_cpp_bridge_and_cache_is_per_instance() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_http_request(&mut stream);
+            write_json_response(&mut stream, "200 OK", &translation_response("単語を覚える"));
+        });
+        let translator = new_translator().unwrap();
+        translator.configure(backend_config(&base_url));
+        translator.submit(42, "Japanese", items());
+        let results = bridge::ffi::cpp_wait_for_results(&translator);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].request_id, 42);
+        assert!(results[0].error.is_empty(), "{}", results[0].error);
+        assert_eq!(results[0].translations[0].text, "単語を覚える");
+        assert_eq!(translator.lookup("Japanese", "背单词"), "単語を覚える");
+        let other = new_translator().unwrap();
+        other.configure(backend_config(&base_url));
+        assert!(other.lookup("Japanese", "背单词").is_empty());
+        translator.clear_cache();
+        assert!(translator.lookup("Japanese", "背单词").is_empty());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn invalidation_discards_in_flight_results_and_cache_writes() {
+        for reconfigure in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                read_http_request(&mut stream);
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                write_json_response(&mut stream, "200 OK", &translation_response("obsolete"));
+                let (mut stream, _) = listener.accept().unwrap();
+                read_http_request(&mut stream);
+                write_json_response(&mut stream, "200 OK", &translation_response("fresh"));
+            });
+            let translator = new_translator().unwrap();
+            translator.configure(backend_config(&base_url));
+            translator.submit(1, "English", items());
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            if reconfigure {
+                translator.configure(backend_config(&base_url));
+            } else {
+                translator.clear_cache();
+            }
+            translator.submit(
+                2,
+                "English",
+                vec![JobItem {
+                    index: 0,
+                    source: "新词".into(),
+                }],
+            );
+            release_tx.send(()).unwrap();
+            let results = bridge::ffi::cpp_wait_for_results(&translator);
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].request_id, 2);
+            assert!(results[0].error.is_empty(), "{}", results[0].error);
+            assert!(translator.lookup("English", "背单词").is_empty());
+            assert_eq!(translator.lookup("English", "新词"), "fresh");
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn dropping_translator_joins_active_worker() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let translator = new_translator().unwrap();
+        translator.configure(backend_config(&format!(
+            "http://{}",
+            listener.local_addr().unwrap()
+        )));
+        translator.submit(1, "English", items());
+        let (mut stream, _) = listener.accept().unwrap();
+        read_http_request(&mut stream);
+        let shared = Arc::clone(&translator.shared);
+        let dropping = thread::spawn(move || drop(translator));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !shared.0.lock().unwrap().stopping {
+            assert!(Instant::now() < deadline, "drop did not stop worker");
+            thread::yield_now();
+        }
+        assert!(!dropping.is_finished());
+        write_json_response(&mut stream, "200 OK", &translation_response("obsolete"));
+        dropping.join().unwrap();
+        let state = shared.0.lock().unwrap();
+        assert!(state.results.is_empty());
+        assert!(state.cache.entries.is_empty());
+        assert_eq!(Arc::strong_count(&shared), 1, "worker still owns state");
     }
 
     #[test]
@@ -1354,7 +1389,7 @@ mod tests {
 
     #[test]
     fn cpp_output_decoration_uses_text_copy() {
-        assert!(unsafe { ct_cpp_self_test() });
+        assert!(bridge::ffi::cpp_self_test());
     }
 
     #[test]
