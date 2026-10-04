@@ -1,10 +1,10 @@
 #include "fcitx5-candidate-translator/src/bridge.rs.h"
 
-#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -85,45 +85,11 @@ struct PendingRequest {
     std::string signature;
 };
 
-bool containsHan(std::string_view text) {
-    for (std::size_t offset = 0; offset < text.size();) {
-        const auto first = static_cast<unsigned char>(text[offset]);
-        std::uint32_t codepoint = 0;
-        std::size_t length = 1;
-        if (first < 0x80) {
-            codepoint = first;
-        } else if ((first & 0xe0) == 0xc0 && offset + 1 < text.size()) {
-            codepoint = ((first & 0x1f) << 6) |
-                        (static_cast<unsigned char>(text[offset + 1]) & 0x3f);
-            length = 2;
-        } else if ((first & 0xf0) == 0xe0 && offset + 2 < text.size()) {
-            codepoint = ((first & 0x0f) << 12) |
-                        ((static_cast<unsigned char>(text[offset + 1]) & 0x3f)
-                         << 6) |
-                        (static_cast<unsigned char>(text[offset + 2]) & 0x3f);
-            length = 3;
-        } else if ((first & 0xf8) == 0xf0 && offset + 3 < text.size()) {
-            codepoint = ((first & 0x07) << 18) |
-                        ((static_cast<unsigned char>(text[offset + 1]) & 0x3f)
-                         << 12) |
-                        ((static_cast<unsigned char>(text[offset + 2]) & 0x3f)
-                         << 6) |
-                        (static_cast<unsigned char>(text[offset + 3]) & 0x3f);
-            length = 4;
-        }
-        if ((codepoint >= 0x3400 && codepoint <= 0x9fff) ||
-            (codepoint >= 0x20000 && codepoint <= 0x323af)) {
-            return true;
-        }
-        offset += length;
-    }
-    return false;
-}
-
-std::size_t utf8Characters(std::string_view text) {
-    return std::count_if(text.begin(), text.end(), [](char value) {
-        return (static_cast<unsigned char>(value) & 0xc0) != 0x80;
-    });
+backend::Candidate prepareCandidate(std::uint32_t index, std::string_view source) {
+    return backend::prepare_candidate(
+        index, rust::Slice<const std::uint8_t>(
+                   reinterpret_cast<const std::uint8_t *>(source.data()),
+                   source.size()));
 }
 
 class CandidateTranslatorAddon final : public fcitx::AddonInstance {
@@ -304,16 +270,18 @@ private:
             const auto &word = list->candidate(index);
             const auto source = word.text().toStringForCommit();
             signature.append("\x1f").append(source);
-            if (!containsHan(source) || utf8Characters(source) > 32 ||
-                word.isPlaceHolder()) {
+            if (word.isPlaceHolder()) {
                 continue;
             }
-            auto cached = translator_->lookup(targetLanguage(), source);
+            auto candidate = prepareCandidate(static_cast<std::uint32_t>(index), source);
+            if (candidate.source.empty()) {
+                continue;
+            }
+            auto cached = translator_->lookup(targetLanguage(), candidate.source);
             if (!cached.empty()) {
                 state.translations.insert_or_assign(source, std::string(cached));
             } else if (missing.size() < 64) {
-                missing.push_back(backend::Candidate{
-                    .index = static_cast<std::uint32_t>(index), .source = source});
+                missing.push_back(std::move(candidate));
             }
         }
         if (state.signature != signature && state.currentRequest != 0) {
@@ -397,6 +365,21 @@ bool candidate_translator::cpp_self_test() {
     display.append("  ");
     display.append("translation", fcitx::TextFormatFlag::Italic);
     return display.toString() == "candidate  translation";
+}
+
+bool candidate_translator::cpp_candidate_validation_test() {
+    // Use the same byte-slice adapter as the addon. Malformed text must reach
+    // Rust and be rejected without throwing during a CXX string conversion.
+    const std::string han = "\xe6\xb1\x89";
+    if (!prepareCandidate(1, han + "\xff").source.empty() ||
+        !prepareCandidate(2, "\xff" + han).source.empty()) {
+        return false;
+    }
+    // A slice carries its full length, including bytes after an embedded NUL.
+    const auto valid = han + std::string("\0abc", 4);
+    auto candidate = prepareCandidate(7, valid);
+    return candidate.index == 7 && std::string(candidate.source) == valid &&
+           prepareCandidate(8, valid + "\xff").source.empty();
 }
 
 rust::Vec<candidate_translator::TranslationResult>

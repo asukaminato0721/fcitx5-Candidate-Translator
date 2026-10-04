@@ -1,4 +1,4 @@
-use crate::{Translator, new_translator};
+use crate::{Translator, new_translator, prepare_candidate};
 
 #[cxx::bridge(namespace = "candidate_translator")]
 pub mod ffi {
@@ -34,6 +34,10 @@ pub mod ffi {
     }
 
     extern "Rust" {
+        // Invalid UTF-8, non-Han text, and text over 32 Unicode scalar values
+        // return a candidate with an empty source. Pass raw bytes so CXX does
+        // not try to validate the incoming text on the C++ side.
+        fn prepare_candidate(index: u32, source: &[u8]) -> Candidate;
         type Translator;
         fn new_translator() -> Result<Box<Translator>>;
         // configure, cancel_requests, and clear_cache discard outstanding work.
@@ -58,6 +62,8 @@ pub mod ffi {
         // Built with the native bridge; exercised by Rust's test harness.
         #[allow(dead_code)]
         fn cpp_self_test() -> bool;
+        #[allow(dead_code)]
+        fn cpp_candidate_validation_test() -> bool;
         #[allow(dead_code)]
         fn cpp_wait_for_results(translator: &Translator) -> Vec<TranslationResult>;
     }

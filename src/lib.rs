@@ -215,6 +215,19 @@ fn is_han(character: char) -> bool {
     matches!(character as u32, 0x3400..=0x9fff | 0x20000..=0x323af)
 }
 
+fn is_translatable(source: &str) -> bool {
+    source.chars().take(33).count() <= 32 && source.chars().any(is_han)
+}
+
+fn prepare_candidate(index: u32, source: &[u8]) -> JobItem {
+    let source = std::str::from_utf8(source)
+        .ok()
+        .filter(|source| is_translatable(source))
+        .unwrap_or_default()
+        .to_owned();
+    JobItem { index, source }
+}
+
 fn kana_reading(text: &str) -> Option<String> {
     if text.chars().count() > 32 {
         return None;
@@ -938,7 +951,9 @@ impl Translator {
             .unwrap_or_default()
     }
 
-    fn submit(&self, request_id: u64, target: &str, items: Vec<JobItem>) {
+    fn submit(&self, request_id: u64, target: &str, mut items: Vec<JobItem>) {
+        // Also enforce the policy for callers that construct Candidate directly.
+        items.retain(|item| is_translatable(&item.source));
         let (lock, condvar) = &*self.shared;
         let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
         if items.is_empty() || items.len() > 64 || !state.config.ready() {
@@ -1099,6 +1114,67 @@ mod tests {
     }
 
     #[test]
+    fn candidate_validation_rejects_malformed_utf8() {
+        // Invalid leading byte, truncated sequence, bad continuation,
+        // overlong encoding, surrogate, and code point above U+10FFFF.
+        for invalid in [
+            &b"\xff"[..],
+            &b"\xe6\xb1"[..],
+            &b"\xe6A\x89"[..],
+            &b"\xc0\xaf"[..],
+            &b"\xed\xa0\x80"[..],
+            &b"\xf4\x90\x80\x80"[..],
+        ] {
+            // Finding Han before the invalid bytes must not short-circuit
+            // validation of the rest of the input.
+            for bytes in [
+                ["汉".as_bytes(), invalid].concat(),
+                [invalid, "汉".as_bytes()].concat(),
+            ] {
+                assert!(prepare_candidate(3, &bytes).source.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn candidate_validation_requires_han_and_preserves_valid_text() {
+        for source in ["", "abc", "かな", "한글", "🙂"] {
+            assert!(prepare_candidate(4, source.as_bytes()).source.is_empty());
+        }
+        for source in [
+            "汉字",
+            "かな漢字",
+            "abc汉🙂",
+            "\u{3400}",
+            "\u{20000}",
+            "汉\0abc",
+        ] {
+            let candidate = prepare_candidate(9, source.as_bytes());
+            assert_eq!(candidate.index, 9);
+            assert_eq!(candidate.source, source);
+        }
+    }
+
+    #[test]
+    fn candidate_length_limit_counts_unicode_scalars() {
+        for character in ["汉", "\u{20000}", "🙂", "\u{301}"] {
+            let at_limit = format!("汉{}", character.repeat(31));
+            assert_eq!(prepare_candidate(0, at_limit.as_bytes()).source, at_limit);
+            let over_limit = format!("{at_limit}{character}");
+            assert!(
+                prepare_candidate(0, over_limit.as_bytes())
+                    .source
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn cpp_passes_candidate_bytes_without_utf8_conversion() {
+        assert!(bridge::ffi::cpp_candidate_validation_test());
+    }
+
+    #[test]
     fn notifications_rearm_and_instances_are_independent() {
         let first = new_translator().unwrap();
         let second = new_translator().unwrap();
@@ -1170,12 +1246,33 @@ mod tests {
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            read_http_request(&mut stream);
+            let body = request_json(&read_http_request(&mut stream));
+            let candidates: Value =
+                serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                candidates,
+                json!([
+                    {"index": 0, "text": "背单词"},
+                    {"index": 2, "text": "被单"}
+                ])
+            );
             write_json_response(&mut stream, "200 OK", &translation_response("単語を覚える"));
         });
         let translator = new_translator().unwrap();
         translator.configure(backend_config(&base_url));
-        translator.submit(42, "Japanese", items());
+        let mut batch = items();
+        batch.extend([
+            prepare_candidate(3, b"\xff"),
+            JobItem {
+                index: 4,
+                source: "ASCII".into(),
+            },
+            JobItem {
+                index: 5,
+                source: "汉".repeat(33),
+            },
+        ]);
+        translator.submit(42, "Japanese", batch);
         let results = bridge::ffi::cpp_wait_for_results(&translator);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].request_id, 42);
@@ -1188,6 +1285,27 @@ mod tests {
         translator.clear_cache();
         assert!(translator.lookup("Japanese", "背单词").is_empty());
         server.join().unwrap();
+    }
+
+    #[test]
+    fn rejected_candidate_batch_does_not_send_http_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let translator = new_translator().unwrap();
+        translator.configure(backend_config(&format!(
+            "http://{}",
+            listener.local_addr().unwrap()
+        )));
+        translator.submit(1, "English", vec![prepare_candidate(0, b"\xff")]);
+        let results = bridge::ffi::cpp_wait_for_results(&translator);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].translations.is_empty());
+        assert!(!results[0].error.is_empty());
+        drop(translator);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]
