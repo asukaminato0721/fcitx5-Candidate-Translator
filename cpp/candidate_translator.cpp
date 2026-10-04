@@ -287,8 +287,7 @@ private:
 
     void filterOutput(fcitx::InputContext *inputContext, fcitx::Text &text) {
         auto state = contexts_.find(inputContext);
-        if (state == contexts_.end() ||
-            instance_->inputMethod(inputContext) != "shuangpin") {
+        if (state == contexts_.end()) {
             return;
         }
         auto currentList = inputContext->inputPanel().candidateList();
@@ -309,9 +308,7 @@ private:
         auto &state = contexts_[inputContext];
         const bool sensitive = inputContext->capabilityFlags().testAny(
             fcitx::CapabilityFlag::PasswordOrSensitive);
-        if (!configured() || sensitive ||
-            instance_->inputMethod(inputContext) != "shuangpin" || !list ||
-            list->empty()) {
+        if (!configured() || sensitive || !list || list->empty()) {
             if (state.currentRequest != 0) {
                 pending_.erase(state.currentRequest);
             }

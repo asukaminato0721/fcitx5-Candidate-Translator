@@ -1,6 +1,6 @@
 # fcitx5 Candidate Translator
 
-给 fcitx5 双拼候选词追加英语或日语翻译。
+给 fcitx5 各输入法中包含汉字的候选词追加英语或日语翻译。
 
 Linux 插件通过 fcitx5 官方 `OutputFilter` 仅装饰发送给候选窗的文本副本，不修改输入法拥有的候选对象，也不会改变实际提交内容。
 
@@ -8,7 +8,7 @@ Linux 插件通过 fcitx5 官方 `OutputFilter` 仅装饰发送给候选窗的�
 
 ![](./Screenshot.png)
 
-当前版本支持 Linux 上的 fcitx5 5.1.x，以及 macOS 13.3+ 上的 [fcitx5-macos](https://github.com/fcitx/fcitx5-macos)。插件针对 `shuangpin` 输入法和 OpenAI Chat Completions 兼容接口；它不支持 macOS 自带的拼音输入法。候选翻译会发送到你配置的远程服务；密码和敏感输入框不会发送请求。
+当前版本支持 Linux 上的 fcitx5 5.1.x，以及 macOS 13.3+ 上的 [fcitx5-macos](https://github.com/fcitx/fcitx5-macos)。插件不限制输入法类型，适用于通过 fcitx5 提供候选列表的所有输入法，并使用 OpenAI Chat Completions 兼容接口；它不支持 macOS 自带的拼音输入法。仅翻译包含汉字且不超过 32 个字符的非占位候选词。候选翻译会发送到你配置的远程服务；密码和敏感输入框不会发送请求。
 
 ## Linux 构建与安装
 
@@ -64,7 +64,7 @@ FCITX5_MACOS_RELEASE=0.3.4 make package-macos
 
 ## 配置
 
-Linux 上打开 `fcitx5-configtool`，返回主界面的“附加组件 / Addons”，搜索“候选词翻译 / Candidate Translator”并点击设置按钮。macOS 上在 Fcitx5 设置中打开同名附加组件。翻译配置属于独立附加组件，不会出现在“双拼”输入法自身的配置页中。
+Linux 上打开 `fcitx5-configtool`，返回主界面的“附加组件 / Addons”，搜索“候选词翻译 / Candidate Translator”并点击设置按钮。macOS 上在 Fcitx5 设置中打开同名附加组件。翻译配置属于独立附加组件，不会出现在各输入法自身的配置页中。
 
 填写：
 
